@@ -11,7 +11,12 @@ Modules:
       alike, so the same evaluator serves both.
     * ``synthetic_dataset.py`` - generate a reproducible dataset of sheets with
       controlled defects, from a real ``.omrt`` template, with ground truth
-      written beside every image.
+      written beside every image. Either fully drawn, or drawn as marks alone
+      and laid onto a real scanned blank form.
+    * ``reference_scan.py``   - register that real blank form against the
+      template once, so the marks land in its bubbles.
+    * ``fold_plans.py``       - which sheets get a folded corner, how hard, and
+      which of the template's markers that actually covers.
     * ``benchmark.py``        - compare results against ground truth, classify
       every disagreement, and write a machine-readable report; plus the
       baseline comparison that says whether a change improved things.

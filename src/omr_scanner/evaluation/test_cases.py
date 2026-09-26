@@ -50,6 +50,7 @@ from omr_scanner.domain.template import (
     IgnoredFieldDefinition,
     QuestionBlockFieldDefinition,
 )
+from omr_scanner.imaging.folds import FoldSpec
 from omr_scanner.imaging.synthetic import DistortionSpec, MarkStyle
 from omr_scanner.recognition.fields import zone_groups
 from omr_scanner.recognition.models import (
@@ -167,6 +168,30 @@ class TestCaseTag(StrEnum):
     ORIENTATION_MISSING = "ORIENTATION_MISSING"
     ORIENTATION_FAINT = "ORIENTATION_FAINT"
 
+    # --- physical page damage ------------------------------------------
+    # A folded corner is not marker *damage*: the marker is undamaged and
+    # simply somewhere else, or underneath the flap. The distinction matters
+    # to a benchmark, because the two have different remedies - reprint the
+    # form, or flatten the paper.
+    FOLD_MICRO = "FOLD_MICRO"
+    FOLD_SMALL = "FOLD_SMALL"
+    FOLD_MODERATE = "FOLD_MODERATE"
+    FOLD_SEVERE = "FOLD_SEVERE"
+    FOLD_MULTIPLE_CORNERS = "FOLD_MULTIPLE_CORNERS"
+    FOLD_NO_MARKER = "FOLD_NO_MARKER"
+    """A fold that reaches no marker at all - the common real case, and the one
+    that must still read perfectly."""
+
+    FOLD_MARKER_TOUCHED = "FOLD_MARKER_TOUCHED"
+    FOLD_MARKER_PARTIAL = "FOLD_MARKER_PARTIAL"
+    FOLD_MARKER_SUBSTANTIAL = "FOLD_MARKER_SUBSTANTIAL"
+    FOLD_MARKER_COVERED = "FOLD_MARKER_COVERED"
+    FOLD_TWO_MARKERS = "FOLD_TWO_MARKERS"
+    """Two markers under one fold. Only ever applied when it was *measured*,
+    never when it was merely requested - on many templates the geometry makes
+    it impossible, and claiming it would put a category in the benchmark that
+    the dataset never tested."""
+
     # --- image quality ------------------------------------------------
     BLUR = "BLUR"
     NOISE = "NOISE"
@@ -283,6 +308,11 @@ class SheetCase:
             damage, by canonical corner role.
         extra_marker: Draw an additional marker-shaped decoy.
         omit_orientation / faint_orientation: Orientation mark damage.
+        folds: Physically folded page corners, applied to the *composed* sheet
+            after everything has been printed and marked on it - so the paper,
+            the printing and the candidate's own marks all fold together, which
+            is what happens. Empty by default, so a sheet planned before this
+            existed renders exactly as it did.
         expect_failure: This sheet should *not* register, and a benchmark must
             not count its refusal as a recognition error.
         duplicate_group: Identifier shared with other sheets in this dataset,
@@ -308,6 +338,7 @@ class SheetCase:
     extra_marker: bool = False
     omit_orientation: bool = False
     faint_orientation: bool = False
+    folds: tuple[FoldSpec, ...] = ()
     expect_failure: bool = False
     duplicate_group: str = ""
     notes: str = ""

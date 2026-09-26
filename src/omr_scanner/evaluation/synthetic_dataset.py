@@ -40,18 +40,49 @@ Why the template drives everything:
     A generator with its own idea of where bubbles go would test the two
     halves of the application against each other's mistakes.
 
+Two rendering modes:
+    :class:`RenderMode` decides where the *page* comes from. The marks, the
+    answers and every piece of ground truth are decided identically either way,
+    before anything is drawn, which is the property that makes the two modes'
+    results comparable:
+
+    ```text
+        case plan  (answers, identifier, set code, degradation)
+              │
+      ┌───────┴────────┐
+      ▼                ▼
+    TEMPLATE      REFERENCE_SCAN
+    draw the      draw only the marks and
+    whole page    lay them on a real blank scan
+      └───────┬────────┘
+              ▼
+        the same ground truth
+    ```
+
 Resolution:
-    Sheets are rendered at :data:`DEFAULT_DPI` from the template's *physical*
-    page size in millimetres, not at its canonical pixel size. That is the
-    honest thing to do - a real scan is whatever the scanner produced, and
-    rendering at the canonical size would hand the engine a page that needed
-    no rescaling and quietly stop testing one.
+    In :attr:`RenderMode.TEMPLATE`, sheets are rendered at :data:`DEFAULT_DPI`
+    from the template's *physical* page size in millimetres, not at its
+    canonical pixel size. That is the honest thing to do - a real scan is
+    whatever the scanner produced, and rendering at the canonical size would
+    hand the engine a page that needed no rescaling and quietly stop testing
+    one.
+
+    In :attr:`RenderMode.REFERENCE_SCAN` the pixels already exist, so the DPI
+    setting has nothing to act on and is not applied; the output is the
+    reference scan at its native resolution. See
+    :mod:`omr_scanner.evaluation.reference_scan`.
 
 An honest warning, stated here because it is easy to forget:
-    Synthetic accuracy is not real accuracy. These pages have clean geometry,
-    even paper and marks drawn by arithmetic. They measure *regression
-    consistency and controlled edge-case handling*, and are nearly useless as
-    evidence that a threshold is right for real pencil on real paper.
+    Synthetic accuracy is not real accuracy. In :attr:`RenderMode.TEMPLATE`
+    these pages have clean geometry, even paper and marks drawn by arithmetic.
+    They measure *regression consistency and controlled edge-case handling*,
+    and are nearly useless as evidence that a threshold is right for real
+    pencil on real paper.
+
+    :attr:`RenderMode.REFERENCE_SCAN` narrows that gap - the paper, the print,
+    the illumination and the scanner's own behaviour are real - but it does not
+    close it. The *marks* are still drawn by arithmetic, and a real candidate's
+    pencil is not an ellipse. It is better evidence, not sufficient evidence.
 """
 
 from __future__ import annotations
@@ -59,7 +90,7 @@ from __future__ import annotations
 import csv
 import json
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import StrEnum
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -81,11 +112,26 @@ from omr_scanner.evaluation.case_plans import (
     families_for,
     plan_dataset,
 )
+from omr_scanner.evaluation.fold_plans import (
+    NO_FOLDS,
+    FoldCorner,
+    FoldPolicy,
+    FoldSeverity,
+    MarkerOutline,
+    describe_folds,
+    marker_outlines,
+    plan_folds,
+)
 from omr_scanner.evaluation.ground_truth import (
     DatasetManifest,
     SheetGroundTruth,
     save_ground_truth,
     save_manifest,
+)
+from omr_scanner.evaluation.reference_scan import (
+    ReferenceScan,
+    load_reference_scan,
+    render_onto_reference,
 )
 from omr_scanner.evaluation.test_cases import (
     CaseFamily,
@@ -94,12 +140,17 @@ from omr_scanner.evaluation.test_cases import (
     SheetCase,
     TestCaseTag,
 )
+from omr_scanner.imaging.folds import PagePlacement, apply_corner_folds
 from omr_scanner.imaging.synthetic import (
     AnswerBubbleSpec,
+    ColorMode,
     DistortionSpec,
     MarkStyle,
     SyntheticSheetSpec,
-    apply_distortion,
+    capture_channels,
+    distort_image,
+    quantise_to_output,
+    render_mark_layer,
     render_sheet,
 )
 from omr_scanner.recognition.fields import zone_groups
@@ -115,13 +166,14 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
 
 _LOGGER = logging.getLogger(__name__)
 
-GENERATOR_VERSION = "2.0"
+GENERATOR_VERSION = "2.2"
 """Version of this generator, recorded in every manifest.
 
 Changing how a defect is drawn changes what a dataset means, so a benchmark
 result that does not say which generator produced its data is not comparable
 with anything. Bumped to 2.0 when named test cases, DPI-based rendering and
-JPEG output arrived."""
+JPEG output arrived, to 2.1 when the reference-scan rendering mode and the
+colour modes did, and to 2.2 for physical corner folds."""
 
 DATASET_SCHEMA_VERSION = "1.0"
 """Version of the dataset *layout* - the directories and the manifest."""
@@ -150,6 +202,75 @@ DEFAULT_JPEG_QUALITY = 92
 High on purpose. Compression *damage* is a degradation case with its own tag
 and its own parameter; it should not arrive uninvited in every dataset that
 happens to be written as JPEG."""
+
+
+class RenderMode(StrEnum):
+    """Where a generated sheet's *page* comes from.
+
+    Only the page. What is marked on it, what the correct answers are and what
+    degradation is applied are decided by the case plan before either mode sees
+    anything, so a dataset generated twice - once each way - differs in its
+    pixels and in nothing else.
+    """
+
+    TEMPLATE = "template"
+    """Draw the whole page from the template: markers, orientation mark, bubble
+    rings, printed option letters and the marks. The default, and what this
+    generator has always done, so an existing call is unaffected."""
+
+    REFERENCE_SCAN = "reference_scan"
+    """Draw only the candidate's marks and lay them on a scan of a real blank
+    form. The paper, the print, the illumination and the scanner's own
+    behaviour are then real rather than modelled; see
+    :mod:`omr_scanner.evaluation.reference_scan`."""
+
+
+RENDER_FROM_REFERENCE_SCAN = "reference_scan"
+"""``PageRender.derived_from`` for a page that came from a real scan.
+
+Alongside the existing ``"physical"`` and ``"canonical"``. A reader of a
+manifest can therefore tell all three apart without knowing which mode was
+used."""
+
+UNDECLARED_DPI = 0
+"""``PageRender.dpi`` when the resolution is genuinely not known.
+
+A real scan does not record what it was scanned at in any form this generator
+can read, and inventing the requested DPI would put a number in the manifest
+that describes nothing. Written out as ``null``, not ``0``, so that a reader
+sees "not applicable" rather than a resolution of zero."""
+
+
+MARKER_DEFECT_TAGS: frozenset[TestCaseTag] = frozenset(
+    {
+        TestCaseTag.MARKER_FAINT,
+        TestCaseTag.MARKER_DAMAGED,
+        TestCaseTag.MARKER_MISSING,
+        TestCaseTag.MARKERS_MISSING_MANY,
+        TestCaseTag.MARKER_EXTRA,
+        TestCaseTag.ORIENTATION_MISSING,
+        TestCaseTag.ORIENTATION_FAINT,
+    }
+)
+"""Tags that describe damage to printed registration or orientation marks.
+
+These are the cases :attr:`RenderMode.REFERENCE_SCAN` cannot produce: the
+markers on a reference sheet were printed and photographed long before this
+generator ran, and it draws only the candidate's ink. Damaging them would mean
+painting over a real scan, which is Checkpoint B's marker-aware occlusion work
+and not something to fake in the meantime."""
+
+INDEPENDENT_FAILURE_TAGS: frozenset[TestCaseTag] = frozenset(
+    {TestCaseTag.CROP_SEVERE}
+)
+"""Tags that predict a refused registration for a reason unrelated to marker
+damage.
+
+Used for exactly one decision: when :func:`strip_unrenderable_defects` removes
+a case's marker damage, does its ``expect_failure`` survive? It survives only
+if the sheet would still fail for one of these reasons. A sheet that was
+expected to fail *because a marker was missing*, and then had the missing
+marker put back, is an ordinary sheet and must be scored as one."""
 
 
 class ImageFormat(StrEnum):
@@ -379,6 +500,90 @@ class GeneratedSheet:
     truth: SheetGroundTruth
 
 
+def strip_unrenderable_defects(case: SheetCase) -> SheetCase:
+    """Return ``case`` with every defect a reference scan cannot express removed.
+
+    A reference sheet's registration and orientation marks were printed and
+    photographed before this generator existed, and
+    :attr:`RenderMode.REFERENCE_SCAN` draws only the candidate's ink. So a case
+    asking for a faint, damaged, missing, extra or absent mark cannot be
+    honoured in that mode.
+
+    The choice made here is to remove the *claim* along with the defect, rather
+    than to drop the sheet or to render it and let the ground truth lie. Three
+    things follow, and all three are deliberate:
+
+    * The tag goes too, so nothing in the dataset says ``MARKER_MISSING`` about
+      a sheet whose markers are all present. A benchmark that grouped by that
+      tag would otherwise report a category it never actually tested.
+    * ``expect_failure`` goes, unless the sheet still carries a reason to fail
+      that has nothing to do with markers (:data:`INDEPENDENT_FAILURE_TAGS`).
+      Putting a missing marker back makes the sheet readable, and a dataset
+      that still expected it to be refused would score a correct reading as an
+      error.
+    * A note is appended saying what was dropped, so a human reading the ground
+      truth of a single sheet can see it happened without going back to the
+      manifest.
+
+    Everything else - the marks, the answers, the identifier, the set code, the
+    geometric and photometric degradation - is untouched, because all of it
+    survives the change of rendering mode intact. That is what keeps the two
+    modes' ground truth identical for every sheet that carries no marker
+    damage, which is the great majority of them.
+
+    Args:
+        case: The planned case.
+
+    Returns:
+        ``case`` itself when it asks for nothing unrenderable, so the common
+        path allocates nothing.
+    """
+    has_defect = bool(
+        case.omit_markers
+        or case.faint_markers
+        or case.damaged_markers
+        or case.extra_marker
+        or case.omit_orientation
+        or case.faint_orientation
+    )
+    if not has_defect:
+        return case
+
+    remaining = tuple(tag for tag in case.tags if tag not in MARKER_DEFECT_TAGS)
+    survives = bool(set(remaining) & INDEPENDENT_FAILURE_TAGS)
+    if not survives:
+        remaining = tuple(
+            tag for tag in remaining if tag is not TestCaseTag.EXPECTED_FAILURE
+        )
+    if not remaining:
+        # Everything it claimed has now gone - the marker-missing case, for
+        # instance, was tagged only ``MARKER_MISSING`` and ``EXPECTED_FAILURE``.
+        # It is still a real sheet, a correctly filled one, and saying so is
+        # necessary: a benchmark groups by tag, and an untagged sheet would be
+        # silently dropped from every category it reports. Checked after the
+        # expected-failure removal, not before, or that removal could empty a
+        # tuple this has already decided was fine.
+        remaining = (TestCaseTag.BASELINE,)
+
+    note = (
+        "Marker and orientation defects were not applied: this sheet was "
+        "rendered onto a real reference scan, whose printed marks the "
+        "generator does not alter."
+    )
+    return replace(
+        case,
+        tags=remaining,
+        omit_markers=(),
+        faint_markers=(),
+        damaged_markers=(),
+        extra_marker=False,
+        omit_orientation=False,
+        faint_orientation=False,
+        expect_failure=case.expect_failure and survives,
+        notes=f"{case.notes} {note}".strip(),
+    )
+
+
 def render_case(
     template: OmrTemplate,
     case: SheetCase,
@@ -388,6 +593,10 @@ def render_case(
     prefix: str = DEFAULT_PREFIX,
     dataset_version: str = "1",
     seed: int = 0,
+    render_mode: RenderMode = RenderMode.TEMPLATE,
+    reference: ReferenceScan | None = None,
+    color_mode: ColorMode = ColorMode.GRAYSCALE,
+    outlines: Sequence[MarkerOutline] | None = None,
 ) -> GeneratedSheet:
     """Render one planned case and return it with its ground truth.
 
@@ -396,21 +605,148 @@ def render_case(
         case: What this sheet is, from
             :func:`~omr_scanner.evaluation.case_plans.plan_dataset`.
         render: Pixel size; derived from the template at
-            :data:`DEFAULT_DPI` when omitted.
+            :data:`DEFAULT_DPI` when omitted. Ignored in
+            :attr:`RenderMode.REFERENCE_SCAN`, where the page's size is the
+            reference scan's own.
         image_format: Decides the file name recorded in the ground truth.
         prefix: File-name prefix.
         dataset_version: Recorded in the ground truth.
         seed: The dataset's master seed, recorded so one sheet can be
             reproduced on its own.
+        render_mode: Where the page comes from; see :class:`RenderMode`.
+        reference: The registered blank scan, required by
+            :attr:`RenderMode.REFERENCE_SCAN` and ignored otherwise. Loaded
+            once per run by :func:`generate_dataset` rather than per sheet,
+            because registering it is the expensive part and its answer does
+            not change between sheets.
+        color_mode: Channel layout and tonal range of the written image.
+        outlines: The template's markers in canonical page coordinates, for
+            describing what a fold covered. Computed once per run by
+            :func:`generate_dataset` and passed in, because re-reading the
+            template for every sheet of a hundred thousand would be the kind of
+            per-sheet reparsing this generator exists without. Derived from
+            ``template`` when omitted, so a single-sheet caller need not supply
+            it.
 
     Returns:
         The image and the ground truth, which is copied from the case rather
         than re-derived - the case already holds the single statement of what
-        was drawn.
-    """
-    size = render if render is not None else page_render_size(template)
-    name = f"{prefix}_{case.index:06d}{image_format.suffix}"
+        was drawn. In :attr:`RenderMode.REFERENCE_SCAN` the case is first put
+        through :func:`strip_unrenderable_defects`, so the truth describes what
+        was actually produced rather than what was planned.
 
+    Raises:
+        ValueError: ``render_mode`` is :attr:`RenderMode.REFERENCE_SCAN` and no
+            ``reference`` was supplied.
+    """
+    if render_mode is RenderMode.REFERENCE_SCAN and reference is None:
+        raise ValueError(
+            "Rendering onto a reference scan needs one; pass reference=..."
+        )
+
+    name = f"{prefix}_{case.index:06d}{image_format.suffix}"
+    # A reference passed in template mode is not the page and must not be
+    # recorded as though it were; the guard above has already ensured one
+    # exists whenever the reference mode actually needs it.
+    source = reference if render_mode is RenderMode.REFERENCE_SCAN else None
+    effective = case if source is None else strip_unrenderable_defects(case)
+
+    if source is not None:
+        size = reference_page_render(source)
+        image = _render_onto_scan(template, effective, source, color_mode)
+    else:
+        size = render if render is not None else page_render_size(template)
+        image = _render_from_template(template, effective, size, color_mode)
+
+    metadata: dict[str, Any] = {
+        "generator_version": GENERATOR_VERSION,
+        "seed": seed,
+        "case_index": effective.index,
+        "render_mode": render_mode.value,
+        "color_mode": color_mode.value,
+        "reference_scan": source.name if source is not None else "",
+        "render": {
+            "width": size.width,
+            "height": size.height,
+            "dpi": size.dpi if size.dpi > 0 else None,
+            "derived_from": size.derived_from,
+        },
+        "mark_styles": _mark_styles(effective),
+    }
+    if effective.folds:
+        # Present only when there is something to say. A sheet that was not
+        # folded carries no fold record at all, so a dataset generated with
+        # folding off has exactly the metadata it had before folding existed.
+        page_width, page_height = _canonical_page(template)
+        metadata["physical_augmentation"] = describe_folds(
+            effective.folds,
+            outlines if outlines is not None else marker_outlines(
+                template, width=page_width, height=page_height
+            ),
+            width=page_width,
+            height=page_height,
+        )
+
+    truth = SheetGroundTruth(
+        scan=name,
+        roll=effective.roll,
+        set_code=effective.set_code,
+        answers=dict(effective.answers),
+        ambiguous=effective.ambiguous_questions,
+        expect_failure=effective.expect_failure,
+        tags=effective.tag_values,
+        roll_marks=effective.roll_marks,
+        roll_ambiguous=effective.roll_ambiguous,
+        set_marks=effective.set_marks,
+        set_ambiguous=effective.set_ambiguous,
+        duplicate_group=effective.duplicate_group,
+        degradation=_degradation_summary(effective),
+        notes=effective.notes,
+        dataset_version=dataset_version,
+        metadata=metadata,
+    )
+    return GeneratedSheet(image=image, truth=truth)
+
+
+def _canonical_page(template: OmrTemplate) -> tuple[float, float]:
+    """The page size fold geometry and marker overlap are expressed in.
+
+    The template's own canonical size, in both rendering modes and at every
+    resolution. That is what makes a fold's recorded depth mean the same thing
+    on a 150 dpi render and on a 600 dpi scan, and what makes the two modes'
+    overlap fractions comparable at all: an overlap measured in scan pixels
+    would depend on how the sheet happened to lie on the platen, because a
+    homography does not preserve area ratios.
+    """
+    return (
+        float(template.page.canonical_width_px),
+        float(template.page.canonical_height_px),
+    )
+
+
+def reference_page_render(reference: ReferenceScan) -> PageRender:
+    """Describe a reference scan the way a rendered page is described.
+
+    So that one ``render`` block in the ground truth means the same thing in
+    both modes: the size of the page *before* degradation, and where that size
+    came from. The DPI is :data:`UNDECLARED_DPI`, because a scan does not carry
+    one that this generator can read - see that constant.
+    """
+    return PageRender(
+        width=reference.width,
+        height=reference.height,
+        dpi=UNDECLARED_DPI,
+        derived_from=RENDER_FROM_REFERENCE_SCAN,
+    )
+
+
+def _render_from_template(
+    template: OmrTemplate,
+    case: SheetCase,
+    size: PageRender,
+    color_mode: ColorMode,
+) -> NDArray[np.uint8]:
+    """Draw the whole page, then degrade it: the original rendering mode."""
     spec = sheet_spec_from_template(
         template,
         case.marks,
@@ -423,38 +759,82 @@ def render_case(
         render=size,
     )
     sheet = render_sheet(spec)
-    image = apply_distortion(sheet, case.distortion).image
+    # Colour before degradation, bilevel after it - see `ColorMode`. With the
+    # grayscale default both calls are no-ops and the pixels are exactly what
+    # this function has always produced.
+    captured = capture_channels(sheet.image, color_mode)
+    folded = _apply_folds(captured, case, template)
+    return quantise_to_output(distort_image(folded, case.distortion), color_mode)
 
-    truth = SheetGroundTruth(
-        scan=name,
-        roll=case.roll,
-        set_code=case.set_code,
-        answers=dict(case.answers),
-        ambiguous=case.ambiguous_questions,
-        expect_failure=case.expect_failure,
-        tags=case.tag_values,
-        roll_marks=case.roll_marks,
-        roll_ambiguous=case.roll_ambiguous,
-        set_marks=case.set_marks,
-        set_ambiguous=case.set_ambiguous,
-        duplicate_group=case.duplicate_group,
-        degradation=_degradation_summary(case),
-        notes=case.notes,
-        dataset_version=dataset_version,
-        metadata={
-            "generator_version": GENERATOR_VERSION,
-            "seed": seed,
-            "case_index": case.index,
-            "render": {
-                "width": size.width,
-                "height": size.height,
-                "dpi": size.dpi,
-                "derived_from": size.derived_from,
-            },
-            "mark_styles": _mark_styles(case),
-        },
+
+def _render_onto_scan(
+    template: OmrTemplate,
+    case: SheetCase,
+    reference: ReferenceScan,
+    color_mode: ColorMode,
+) -> NDArray[np.uint8]:
+    """Draw only the marks, lay them on the real scan, then degrade the result.
+
+    The mark layer is rendered at the size the reference asks for rather than
+    at the DPI-derived page size, because it is about to be warped into that
+    scan's pixels and rendering it smaller would cost sharpness that cannot be
+    recovered afterwards.
+    """
+    layer_width, layer_height = reference.mark_layer_size
+    spec = sheet_spec_from_template(
+        template,
+        case.marks,
+        render=PageRender(
+            width=layer_width,
+            height=layer_height,
+            dpi=UNDECLARED_DPI,
+            derived_from=RENDER_FROM_REFERENCE_SCAN,
+        ),
     )
-    return GeneratedSheet(image=image, truth=truth)
+    composited = render_onto_reference(reference, render_mark_layer(spec))
+    folded = _apply_folds(composited, case, template, reference=reference)
+    return quantise_to_output(distort_image(folded, case.distortion), color_mode)
+
+
+def _apply_folds(
+    image: NDArray[np.uint8],
+    case: SheetCase,
+    template: OmrTemplate,
+    *,
+    reference: ReferenceScan | None = None,
+) -> NDArray[np.uint8]:
+    """Fold the composed sheet, if this case has any folds.
+
+    Called at the same point in both rendering modes, and that point is the
+    whole of the physical argument: **after** the page, its printing and the
+    candidate's marks have been put together, and **before** the scanner gets
+    hold of it. A fold applied earlier would fold the paper without folding
+    what is written on it; applied later it would be a fold that the scanner's
+    own blur and noise had somehow got underneath.
+
+    The two modes differ only in where the page sits in the image:
+
+    * template-rendered - the page fills the image, described in the
+      template's canonical units so that the same fold means the same thing at
+      any resolution;
+    * reference scan - the page is somewhere inside a larger scan, at whatever
+      angle and scale it was fed at, and the registration homography Checkpoint
+      A already computed says where. No second registration, and no single
+      scalar standing in for two different axis scales.
+    """
+    if not case.folds:
+        return image
+    page_width, page_height = _canonical_page(template)
+    placement = (
+        PagePlacement(
+            width=float(reference.canonical_width),
+            height=float(reference.canonical_height),
+            to_image=reference.canonical_to_scan,
+        )
+        if reference is not None
+        else PagePlacement.scaled_to(image, width=page_width, height=page_height)
+    )
+    return apply_corner_folds(image, case.folds, placement)
 
 
 def _degradation_summary(case: SheetCase) -> dict[str, Any]:
@@ -540,6 +920,10 @@ def generate_dataset(
     template_path: str = "",
     write_metadata: bool = True,
     population: Population | None = None,
+    render_mode: RenderMode = RenderMode.TEMPLATE,
+    reference_scan: Path | None = None,
+    color_mode: ColorMode = ColorMode.GRAYSCALE,
+    fold_policy: FoldPolicy | None = None,
     on_progress: Callable[[GenerationProgress], None] | None = None,
     should_cancel: Callable[[], bool] | None = None,
 ) -> DatasetManifest:
@@ -574,6 +958,19 @@ def generate_dataset(
             writes ``attendance/`` and the two reconciliation ground-truth
             files. ``count`` is ignored, because the population already
             answered it.
+        render_mode: Where each sheet's page comes from; see
+            :class:`RenderMode`.
+        reference_scan: The blank scan to lay marks on. Required by
+            :attr:`RenderMode.REFERENCE_SCAN` and ignored otherwise. Loaded and
+            registered **once**, before any sheet is rendered, so a file that
+            cannot be used fails the run immediately rather than after several
+            thousand images have been written.
+        color_mode: Channel layout and tonal range of every written image.
+        fold_policy: Physical corner folds; see
+            :class:`~omr_scanner.evaluation.fold_plans.FoldPolicy`. Disabled
+            when omitted, and a disabled policy leaves every sheet exactly as
+            it would have been - which is what keeps every existing caller and
+            every existing dataset unaffected.
         on_progress: Called after each sheet is written. Runs on the calling
             thread, so a GUI caller must marshal to the main thread.
         should_cancel: Polled before each sheet; returning ``True`` stops the
@@ -583,13 +980,18 @@ def generate_dataset(
         The manifest, already written.
 
     Raises:
-        ValueError: ``count`` is not positive, the format is unsupported, or
-            the template declares no bubble grids to fill in.
+        ValueError: ``count`` is not positive, the format is unsupported, the
+            template declares no bubble grids to fill in, or
+            :attr:`RenderMode.REFERENCE_SCAN` was asked for without a scan.
+        ReferenceScanError: The reference scan could not be decoded or could
+            not be registered against ``template``.
 
     Memory:
         One sheet is rendered, encoded, written and released before the next
         begins. A dataset of ten thousand sheets therefore costs one page of
-        memory, not ten thousand.
+        memory, not ten thousand. In :attr:`RenderMode.REFERENCE_SCAN` one
+        additional copy of the reference scan and one mark layer are held for
+        the whole run, which is two pages rather than ten thousand and one.
     """
     import cv2
 
@@ -604,8 +1006,22 @@ def generate_dataset(
         raise ValueError(
             "This template declares no bubble grids, so there is nothing to generate"
         )
+    if render_mode is RenderMode.REFERENCE_SCAN and reference_scan is None:
+        raise ValueError(
+            "Rendering onto a real scanned sheet needs a reference scan; "
+            "pass reference_scan=..."
+        )
 
-    render = page_render_size(template, dpi)
+    reference = (
+        load_reference_scan(reference_scan, template, color_mode=color_mode)
+        if render_mode is RenderMode.REFERENCE_SCAN and reference_scan is not None
+        else None
+    )
+    render = (
+        reference_page_render(reference)
+        if reference is not None
+        else page_render_size(template, dpi)
+    )
 
     # The population, when there is one, is the authority on how many scripts
     # exist - a cohort with absentees and missing scans produces fewer sheets
@@ -635,6 +1051,20 @@ def generate_dataset(
             for case, candidate in zip(cases, sheets, strict=True)
         ]
 
+    # Read once for the whole run, never per sheet: the template's markers do
+    # not move between sheets, and re-deriving them a hundred thousand times
+    # would be the per-sheet reparsing this generator is built without.
+    page_width, page_height = _canonical_page(template)
+    outlines = marker_outlines(template, width=page_width, height=page_height)
+    folds = fold_policy if fold_policy is not None else NO_FOLDS
+    if folds.active:
+        # Assigned after identity, so a folded sheet is still whoever the
+        # population said it was - folding changes the paper, never the
+        # candidate.
+        cases = plan_folds(
+            cases, folds, outlines, width=page_width, height=page_height, seed=seed
+        )
+
     images = output_dir / IMAGES_DIRNAME
     truths = output_dir / GROUND_TRUTH_DIRNAME
     images.mkdir(parents=True, exist_ok=True)
@@ -651,13 +1081,16 @@ def generate_dataset(
     cancelled = False
 
     _LOGGER.info(
-        "Generating %d synthetic sheet(s): profile=%s seed=%d %dx%d @%d dpi (%s) format=%s",
+        "Generating %d synthetic sheet(s): mode=%s colour=%s profile=%s seed=%d "
+        "%dx%d %s (%s) format=%s",
         len(cases),
+        render_mode.value,
+        color_mode.value,
         profile.value,
         seed,
         render.width,
         render.height,
-        render.dpi,
+        f"@{render.dpi} dpi" if render.dpi > 0 else "native",
         render.derived_from,
         chosen_format.value,
     )
@@ -676,6 +1109,10 @@ def generate_dataset(
             prefix=prefix,
             dataset_version=version,
             seed=seed,
+            render_mode=render_mode,
+            reference=reference,
+            color_mode=color_mode,
+            outlines=outlines,
         )
         success, buffer = cv2.imencode(chosen_format.suffix, sheet.image, encode_params)
         if not success:  # pragma: no cover - encoding a valid array
@@ -716,18 +1153,25 @@ def generate_dataset(
             "template_id": template.template_id,
             "template_name": template.name,
             "template_version": template.format_version,
-            "dpi": render.dpi,
+            # Null rather than the requested value when the pages came from a
+            # real scan: the setting was not applied, and recording it as
+            # though it were would describe a dataset nobody generated.
+            "dpi": render.dpi if render.dpi > 0 else None,
             "page_pixels": [render.width, render.height],
             "page_size_from": render.derived_from,
+            "render_mode": render_mode.value,
+            "color_mode": color_mode.value,
+            "reference_scan": reference.describe() if reference is not None else None,
+            # Null when nothing was folded, matching the reference scan above:
+            # a reader sees "this was not done" rather than a block of defaults
+            # describing folds that never happened.
+            "folds": folds.describe() if folds.active else None,
             "image_format": chosen_format.value,
             "jpeg_quality": jpeg_quality if chosen_format is ImageFormat.JPEG else None,
             "cancelled": cancelled,
         },
         entries=tuple(entries),
-        notes=(
-            "Synthetic data. Measures regression consistency and controlled "
-            "edge-case handling; not evidence of real-world recognition accuracy."
-        ),
+        notes=_dataset_caveat(render_mode),
     )
     if population is not None:
         # Written after the images, and derived from the *plan* rather than
@@ -752,6 +1196,27 @@ def generate_dataset(
         " (cancelled)" if cancelled else "",
     )
     return manifest
+
+
+def _dataset_caveat(render_mode: RenderMode) -> str:
+    """Return the standing warning that belongs on a dataset made this way.
+
+    Two different warnings because the two modes are honest about different
+    things, and a dataset carrying the wrong one overstates or understates what
+    it is worth. Neither says "validated": the marks are drawn by arithmetic in
+    both modes, and a real candidate's pencil is not an ellipse.
+    """
+    if render_mode is RenderMode.REFERENCE_SCAN:
+        return (
+            "Synthetic marks on a real scanned blank sheet. The paper, printing, "
+            "illumination and scanner behaviour are real; the marks are not. "
+            "Measures recognition against real page conditions, and is still not "
+            "a substitute for scans of real human-filled sheets."
+        )
+    return (
+        "Synthetic data. Measures regression consistency and controlled "
+        "edge-case handling; not evidence of real-world recognition accuracy."
+    )
 
 
 MANIFEST_COLUMNS: tuple[str, ...] = (
@@ -863,24 +1328,37 @@ __all__ = [
     "GENERATOR_VERSION",
     "GROUND_TRUTH_DIRNAME",
     "IMAGES_DIRNAME",
+    "INDEPENDENT_FAILURE_TAGS",
     "MANIFEST_CSV_FILENAME",
     "MANIFEST_FILENAME",
+    "MARKER_DEFECT_TAGS",
+    "RENDER_FROM_REFERENCE_SCAN",
     "SUMMARY_FILENAME",
+    "UNDECLARED_DPI",
     "CaseFamily",
+    "ColorMode",
     "DatasetProfile",
+    "FoldCorner",
+    "FoldPolicy",
+    "FoldSeverity",
     "GeneratedSheet",
     "GenerationProgress",
     "ImageFormat",
     "MarkPlan",
     "PageRender",
+    "ReferenceScan",
+    "RenderMode",
     "SheetCase",
     "TestCaseTag",
     "describe_template",
     "generate_dataset",
+    "load_reference_scan",
     "page_render_size",
     "plan_dataset",
+    "reference_page_render",
     "render_case",
     "sheet_spec_from_template",
+    "strip_unrenderable_defects",
     "validate_template",
 ]
 

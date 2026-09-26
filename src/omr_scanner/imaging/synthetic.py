@@ -40,6 +40,26 @@ Marked bubbles (Phase 3):
     Deriving the positions from a template is the caller's job - the test
     fixtures in ``tests/conftest.py`` do it.
 
+The mark layer, and why it is a separate render:
+    :func:`render_mark_layer` draws the candidate's ink *and nothing else* -
+    no registration markers, no bubble rings, no printed option letters, no
+    decoy graphics. It exists so that a sheet can be produced by compositing
+    those marks onto a photograph of a real blank form instead of onto a page
+    this module drew, which is the only way a generated dataset carries real
+    paper texture, real print and real scanner behaviour under known answers.
+
+    It deliberately shares :func:`_draw_mark` with the full render rather than
+    reimplementing the shapes. A second copy of the mark geometry would drift,
+    and a dataset whose two rendering modes disagreed about where ``fill=0.35``
+    puts ink would make the two modes' results incomparable - which is the one
+    thing a second mode must not cost.
+
+Colour:
+    Everything here draws in grayscale, because a printed OMR sheet carries no
+    colour information to invent. :class:`ColorMode` and its two helpers exist
+    for the *output* stage: see that class's docstring for why a colour choice
+    has to be applied in two places rather than one.
+
 What does NOT belong here:
     * Any knowledge of templates, fields or answers. This module draws circles
       where it is told to.
@@ -56,7 +76,7 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass, field
 from enum import StrEnum
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import cv2
 import numpy as np
@@ -148,6 +168,47 @@ class MarkStyle(StrEnum):
     SLASH = "slash"
     """One diagonal stroke - half a cross, and a genuinely common way of
     answering a paper form."""
+
+
+class ColorMode(StrEnum):
+    """The channel layout and tonal range a generated image is written in.
+
+    These are the three settings a real office scanner offers, and the choice
+    is not cosmetic: each one changes what the recognition engine is handed.
+
+    Applied in **two** places, which is the only part of this that is not
+    obvious. A scanner captures in grey or in colour, and *then*, if it was set
+    to black-and-white, quantises what it captured to one bit. So:
+
+    * :func:`capture_channels` runs before degradation, and is what makes
+      :attr:`COLOR` mean something - noise, speckle, blur and JPEG then act per
+      channel, the way they do on a real colour scan, rather than being applied
+      to one grey plane that is copied into three afterwards.
+    * :func:`quantise_to_output` runs last, and is what makes
+      :attr:`BLACK_AND_WHITE` mean something - thresholding before the blur and
+      the noise would let them put the grey levels straight back, which is
+      exactly what a bilevel scan does not contain.
+    """
+
+    GRAYSCALE = "grayscale"
+    """One channel, full 0-255 range. What this generator has always produced,
+    and the default, so an existing dataset is unaffected by this choice
+    existing."""
+
+    COLOR = "color"
+    """Three channels, BGR. A black-on-white form carries no colour of its own,
+    so the *page* is grey replicated across three channels; what colour buys is
+    that the per-channel degradations become per-channel, and that the engine's
+    own grayscale conversion is exercised instead of skipped."""
+
+    BLACK_AND_WHITE = "bw"
+    """One channel holding only 0 and 255, thresholded by Otsu's method.
+
+    The hardest of the three for recognition, and deliberately so: a bilevel
+    scan has thrown away the grey levels a faint pencil mark lives in, before
+    the engine ever sees the page. A dataset generated this way should be
+    *expected* to lose faint and low-intensity marks - that is the honest
+    behaviour of the setting, not a defect in the engine."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -289,6 +350,28 @@ class SyntheticSheet:
     marker_centers: tuple[Point, ...]
     control_points: tuple[Point, ...]
     spec: SyntheticSheetSpec
+
+
+@dataclass(frozen=True, slots=True)
+class MarkLayer:
+    """Only the candidate's ink, on an otherwise untouched page.
+
+    Attributes:
+        image: Grayscale, page-sized. ``255`` everywhere the candidate did not
+            write; darker where they did, including the partial values
+            anti-aliased strokes leave at their edges. Those partial values are
+            the reason this is a grey image rather than a boolean mask: a tick
+            drawn with ``cv2.LINE_AA`` has soft edges, and hardening them into
+            a mask would composite a jagged mark onto real paper.
+        spec: The specification it was drawn from, so a caller can recover the
+            page size the coordinates are in.
+        mark_count: How many bubbles actually received ink. Zero is a legitimate
+            answer - an all-blank sheet - and is worth being able to assert.
+    """
+
+    image: NDArray[np.uint8]
+    spec: SyntheticSheetSpec
+    mark_count: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -448,6 +531,142 @@ def render_sheet(spec: SyntheticSheetSpec | None = None) -> SyntheticSheet:
     )
 
 
+def render_mark_layer(spec: SyntheticSheetSpec | None = None) -> MarkLayer:
+    """Render the candidate's marks alone, with no printed page under them.
+
+    Every other element :func:`render_sheet` draws - registration markers, the
+    orientation dash, bubble rings, printed option letters, control points,
+    text bars, answer frames, decoys - is deliberately absent. What comes back
+    is what a candidate added to a form that was already printed, which is
+    precisely what can be laid over a scan of that printed form.
+
+    An **unmarked** bubble contributes nothing at all, not even its printed
+    letter: on a real blank sheet that letter is already there, and drawing it
+    again would double the ink inside every empty bubble and quietly raise the
+    measured fill ratio of the one thing the engine must read as empty.
+
+    Args:
+        spec: The page, in the same coordinates :func:`render_sheet` uses.
+
+    Returns:
+        The ink layer and how many bubbles received any.
+    """
+    active = spec if spec is not None else SyntheticSheetSpec()
+    image: NDArray[np.uint8] = np.full((active.height, active.width), _PAPER, dtype=np.uint8)
+    sample_ratio = BubbleMetricsConfig().sample_radius_ratio
+
+    drawn = 0
+    for bubble in active.answer_bubbles:
+        if bubble.fill <= 0.0:
+            continue
+        center = active.to_pixels(bubble.center)
+        _draw_mark(
+            image,
+            bubble,
+            center=(center.x, center.y),
+            half_x=bubble.width * active.width / 2.0,
+            half_y=bubble.height * active.height / 2.0,
+            sample_ratio=sample_ratio,
+        )
+        drawn += 1
+
+    return MarkLayer(image=image, spec=active, mark_count=drawn)
+
+
+def composite_marks(
+    background: NDArray[np.uint8], marks: NDArray[np.uint8]
+) -> NDArray[np.uint8]:
+    """Lay a mark layer over a page, the way ink lies on paper.
+
+    Multiplicative rather than a paste or a minimum, because that is what ink
+    physically does: it absorbs a fraction of the light the paper would have
+    reflected. Three consequences follow, and all three matter:
+
+    * The paper's own texture, print and shading survive underneath a mark
+      instead of being replaced by a flat grey disc.
+    * An anti-aliased stroke edge blends correctly against whatever it lands
+      on, rather than producing a hard step.
+    * A mark drawn over printing that is already dark cannot make it lighter,
+      which a paste could.
+
+    Args:
+        background: The page, grayscale or BGR. Read only.
+        marks: A grayscale mark layer the same height and width, ``255`` where
+            there is no ink.
+
+    Returns:
+        A new array with ``background``'s shape and dtype.
+
+    Raises:
+        ValueError: The two images are not the same height and width.
+    """
+    if background.shape[:2] != marks.shape[:2]:
+        raise ValueError(
+            f"Mark layer {marks.shape[:2]} does not match the page {background.shape[:2]}"
+        )
+    absorption = marks.astype(np.float32) / float(_PAPER)
+    if background.ndim == 3:
+        absorption = absorption[..., np.newaxis]
+    composited: NDArray[np.uint8] = np.clip(
+        background.astype(np.float32) * absorption, 0, 255
+    ).astype(np.uint8)
+    return composited
+
+
+def capture_channels(
+    image: NDArray[np.uint8], mode: ColorMode
+) -> NDArray[np.uint8]:
+    """Return ``image`` in the channel layout ``mode``'s sensor would deliver.
+
+    Called *before* degradation - see :class:`ColorMode`. Only
+    :attr:`ColorMode.COLOR` changes anything here; black-and-white is captured
+    in grey and quantised afterwards, which is the order a scanner works in.
+    """
+    if mode is ColorMode.COLOR:
+        if image.ndim == 2:
+            return np.asarray(cv2.cvtColor(image, cv2.COLOR_GRAY2BGR), dtype=np.uint8)
+        if image.shape[2] == 4:
+            return np.asarray(cv2.cvtColor(image, cv2.COLOR_BGRA2BGR), dtype=np.uint8)
+        return image
+    return _to_grayscale(image)
+
+
+def _to_grayscale(image: NDArray[np.uint8]) -> NDArray[np.uint8]:
+    """Flatten a colour page to one channel, whatever it arrived as.
+
+    Handles the alpha channel a TIFF or a PNG can carry, the same way
+    :mod:`omr_scanner.imaging.preprocessing` does - a four-channel array through
+    ``COLOR_BGR2GRAY`` is an OpenCV assertion, not a usable error.
+    """
+    if image.ndim == 2:
+        return image
+    code = cv2.COLOR_BGRA2GRAY if image.shape[2] == 4 else cv2.COLOR_BGR2GRAY
+    return np.asarray(cv2.cvtColor(image, code), dtype=np.uint8)
+
+
+def quantise_to_output(
+    image: NDArray[np.uint8], mode: ColorMode
+) -> NDArray[np.uint8]:
+    """Return ``image`` reduced to the tonal range ``mode`` writes.
+
+    Called *last* - see :class:`ColorMode`. Only
+    :attr:`ColorMode.BLACK_AND_WHITE` changes anything, and it throws grey
+    levels away on purpose.
+
+    Otsu's method rather than a fixed threshold, because a fixed one would
+    interact with the brightness and paper-tint degradations in a way that has
+    nothing to do with what a bilevel scanner does: a real one adapts to the
+    page in front of it.
+    """
+    if mode is not ColorMode.BLACK_AND_WHITE:
+        return image
+    grayscale = _to_grayscale(image)
+    _threshold, binary = cv2.threshold(
+        grayscale, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU
+    )
+    return np.asarray(binary, dtype=np.uint8)
+
+
 def distortion_homography(
     sheet: SyntheticSheet, spec: DistortionSpec
 ) -> tuple[NDArray[np.float64], tuple[int, int]]:
@@ -462,7 +681,24 @@ def distortion_homography(
     Returns:
         ``(homography, (width, height))``.
     """
-    width, height = float(sheet.spec.width), float(sheet.spec.height)
+    return page_distortion_homography(sheet.spec.width, sheet.spec.height, spec)
+
+
+def page_distortion_homography(
+    width_px: int, height_px: int, spec: DistortionSpec
+) -> tuple[NDArray[np.float64], tuple[int, int]]:
+    """Return the homography a distortion applies to a page of a given size.
+
+    The size-only form of :func:`distortion_homography`, for the images that
+    are not a :class:`SyntheticSheet` at all - a real scan with marks
+    composited onto it has the same geometry applied by the same arithmetic,
+    and computing it twice in two places is how the two rendering modes would
+    come to disagree about what "six degrees" means.
+
+    Returns:
+        ``(homography, (width, height))``.
+    """
+    width, height = float(width_px), float(height_px)
     corners = np.array(
         [[0.0, 0.0], [width, 0.0], [width, height], [0.0, height]], dtype=np.float64
     )
@@ -510,9 +746,53 @@ def apply_distortion(sheet: SyntheticSheet, spec: DistortionSpec) -> DistortedSh
     order: the page is placed on the platen, then exposed, then compressed.
     """
     homography, canvas = distortion_homography(sheet, spec)
-    image = np.asarray(
+    image = _warp_page(sheet.image, homography, canvas)
+    image = _apply_photometry(image, spec)
+
+    return DistortedSheet(
+        image=image,
+        homography=homography,
+        marker_centers=project(homography, sheet.marker_centers),
+        control_points=project(homography, sheet.control_points),
+        source=sheet,
+        spec=spec,
+    )
+
+
+def distort_image(
+    image: NDArray[np.uint8], spec: DistortionSpec
+) -> NDArray[np.uint8]:
+    """Apply a distortion to any page-shaped image, synthetic or photographed.
+
+    The same geometry and the same photometry :func:`apply_distortion` uses,
+    minus the ground truth - because a real scan with marks composited onto it
+    has no synthetic marker centres to project, and its own geometry was
+    decided by the scanner rather than by this module.
+
+    Works on grayscale and on BGR: every stage below is channel-aware, which
+    is what lets a colour dataset receive real per-channel noise instead of one
+    grey plane copied three times.
+
+    Args:
+        image: The page. Read only.
+        spec: The degradation to apply.
+
+    Returns:
+        A new array, the same channel layout as ``image``.
+    """
+    homography, canvas = page_distortion_homography(image.shape[1], image.shape[0], spec)
+    return _apply_photometry(_warp_page(image, homography, canvas), spec)
+
+
+def _warp_page(
+    image: NDArray[np.uint8],
+    homography: NDArray[np.float64],
+    canvas: tuple[int, int],
+) -> NDArray[np.uint8]:
+    """Warp a page onto the distortion's canvas, padding with paper."""
+    return np.asarray(
         cv2.warpPerspective(
-            sheet.image,
+            image,
             homography,
             canvas,
             flags=cv2.INTER_LINEAR,
@@ -522,6 +802,11 @@ def apply_distortion(sheet: SyntheticSheet, spec: DistortionSpec) -> DistortedSh
         dtype=np.uint8,
     )
 
+
+def _apply_photometry(
+    image: NDArray[np.uint8], spec: DistortionSpec
+) -> NDArray[np.uint8]:
+    """Apply every non-geometric stage of a distortion, in scanner order."""
     if spec.brightness_gain != 1.0 or spec.brightness_offset != 0.0:
         image = np.asarray(
             cv2.convertScaleAbs(image, alpha=spec.brightness_gain, beta=spec.brightness_offset),
@@ -553,16 +838,12 @@ def apply_distortion(sheet: SyntheticSheet, spec: DistortionSpec) -> DistortedSh
         )
         if not encoded:
             raise RuntimeError("JPEG encoding of the synthetic scan failed")
-        image = np.asarray(cv2.imdecode(buffer, cv2.IMREAD_GRAYSCALE), dtype=np.uint8)
+        # Decoded back in whatever layout it went in as: forcing grayscale here
+        # would silently discard the channels a colour dataset exists to have.
+        flag = cv2.IMREAD_GRAYSCALE if image.ndim == 2 else cv2.IMREAD_COLOR
+        image = np.asarray(cv2.imdecode(buffer, flag), dtype=np.uint8)
 
-    return DistortedSheet(
-        image=image,
-        homography=homography,
-        marker_centers=project(homography, sheet.marker_centers),
-        control_points=project(homography, sheet.control_points),
-        source=sheet,
-        spec=spec,
-    )
+    return image
 
 
 @dataclass(frozen=True, slots=True)
@@ -756,10 +1037,16 @@ def _add_speckle(
 
     What a dusty platen or a cheap photocopier produces. Kept as isolated
     pixels: a speck the size of a bubble would be a different test.
+
+    The draw is over the image's *pixels*, not its values, so a speck on a
+    colour page is a black or white speck rather than three independent
+    per-channel draws that would come out coloured - which is not what dust
+    looks like. On a grayscale page the two are identical, so this costs the
+    existing behaviour nothing.
     """
     generator = np.random.default_rng(seed)
     result = image.copy()
-    draw = generator.random(image.shape)
+    draw = generator.random(image.shape[:2])
     result[draw < density / 2.0] = _INK
     result[draw > 1.0 - density / 2.0] = _PAPER
     return result
@@ -789,7 +1076,7 @@ def _add_edge_shadow(image: NDArray[np.uint8], strength: float) -> NDArray[np.ui
     """Darken one edge, the way a lifted page shades under a platen lid."""
     width = image.shape[1]
     ramp = np.linspace(1.0 - strength, 1.0, width, dtype=np.float32)
-    values = image.astype(np.float32) * ramp[np.newaxis, :]
+    values = image.astype(np.float32) * _per_pixel(ramp[np.newaxis, :], image)
     shaded: NDArray[np.uint8] = np.clip(values, 0, 255).astype(np.uint8)
     return shaded
 
@@ -802,7 +1089,22 @@ def _apply_illumination_gradient(
     ramp_y = np.linspace(0.0, 1.0, height, dtype=np.float64)[:, None]
     ramp_x = np.linspace(0.0, 1.0, width, dtype=np.float64)[None, :]
     factor = 1.0 - strength * (ramp_x + ramp_y) / 2.0
-    return np.clip(image.astype(np.float64) * factor, 0, 255).astype(np.uint8)
+    return np.clip(
+        image.astype(np.float64) * _per_pixel(factor, image), 0, 255
+    ).astype(np.uint8)
+
+
+def _per_pixel(
+    factor: NDArray[np.floating[Any]], image: NDArray[np.uint8]
+) -> NDArray[np.floating[Any]]:
+    """Shape a per-pixel multiplier so it applies to every channel equally.
+
+    Shading darkens the *paper*, not one colour of it, so a factor computed
+    over the page's pixels has to reach all three channels of a colour scan.
+    A grayscale image is returned untouched, which is why the existing
+    grayscale output is bit-for-bit what it always was.
+    """
+    return factor[..., np.newaxis] if image.ndim == 3 else factor
 
 
 def _draw_filled_rectangle(

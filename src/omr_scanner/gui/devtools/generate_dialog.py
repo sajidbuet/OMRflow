@@ -20,6 +20,21 @@ Why the template is a file rather than "the loaded one":
     same one. Naming the file, and recording it in the manifest, is what makes
     a dataset traceable three months later; borrowing whatever happened to be
     loaded would produce datasets nobody can attribute.
+
+Why the reference scan is not remembered between runs:
+    It is an input to *this* job, like the template and the output folder, and
+    the dialog treats it as one. Persisting it would mean introducing a
+    preference store this application does not have, to remember a path whose
+    usefulness expires with the run. The Browse button opens on the current
+    project's folder instead, which is where a scanned blank form is kept.
+
+Why the dialog cannot tell you the scan is unusable before you press Generate:
+    Checking would mean registering it, which is an imaging operation, and this
+    layer must not import ``cv2``, ``numpy`` or ``omr_scanner.imaging`` (see
+    ``docs/ARCHITECTURE.md`` and ``tests/unit/test_architecture.py``). So the
+    dialog checks that a file was chosen and exists, and the worker reports the
+    registration failure - which it does before writing a single sheet, so the
+    answer still arrives immediately rather than after a long run.
 """
 
 from __future__ import annotations
@@ -57,12 +72,18 @@ from omr_scanner.evaluation.attendance_dataset import (
     Population,
     plan_population,
 )
+from omr_scanner.evaluation.fold_plans import NO_FOLDS
 from omr_scanner.evaluation.synthetic_dataset import (
     DEFAULT_DPI,
     DEFAULT_JPEG_QUALITY,
     CaseFamily,
+    ColorMode,
     DatasetProfile,
+    FoldCorner,
+    FoldPolicy,
+    FoldSeverity,
     ImageFormat,
+    RenderMode,
 )
 from omr_scanner.gui.theme import Spacing
 from omr_scanner.gui.widgets.collapsible import CollapsibleSection
@@ -106,6 +127,64 @@ and three columns of that need more width than the dialog's preferred size
 gives, which would push the form into horizontal scrolling on exactly the
 narrow displays this layout exists to serve."""
 
+RENDER_MODE_LABELS: dict[RenderMode, str] = {
+    RenderMode.TEMPLATE: "Template-rendered synthetic",
+    RenderMode.REFERENCE_SCAN: "Real scanned sheet + synthetic markings",
+}
+"""How each rendering mode is named to an operator.
+
+Spelled out rather than derived from the enum value: "reference_scan" does not
+tell somebody choosing between them what the difference is."""
+
+RENDER_MODE_DESCRIPTIONS: dict[RenderMode, str] = {
+    RenderMode.TEMPLATE: (
+        "The whole page is drawn from the template: markers, bubbles and marks. "
+        "Clean geometry and even paper - good for regressions, weak evidence "
+        "about real scans."
+    ),
+    RenderMode.REFERENCE_SCAN: (
+        "Only the marks are drawn, onto a scan of a real blank form. Real paper, "
+        "print, lighting and scanner behaviour; the resolution comes from the "
+        "scan, so Resolution (dpi) is not used. Marker-damage cases are skipped "
+        "- the printed markers belong to the scan."
+    ),
+}
+"""What each mode is *for*, and what it costs. Both halves matter: an operator
+choosing the reference mode needs to know the DPI setting stops applying and
+that the marker cases will not be generated."""
+
+COLOR_MODE_LABELS: dict[ColorMode, str] = {
+    ColorMode.GRAYSCALE: "Grayscale",
+    ColorMode.COLOR: "Colour (RGB)",
+    ColorMode.BLACK_AND_WHITE: "Black and white (1-bit)",
+}
+
+CORNER_LABELS: dict[FoldCorner, str] = {
+    FoldCorner.TOP_LEFT: "Top-left",
+    FoldCorner.TOP_RIGHT: "Top-right",
+    FoldCorner.BOTTOM_LEFT: "Bottom-left",
+    FoldCorner.BOTTOM_RIGHT: "Bottom-right",
+}
+
+SEVERITY_LABELS: dict[FoldSeverity, str] = {
+    FoldSeverity.MICRO: "Micro (a few mm)",
+    FoldSeverity.SMALL: "Small (a dog-ear)",
+    FoldSeverity.MODERATE: "Moderate",
+    FoldSeverity.SEVERE: "Severe (reaches a marker)",
+}
+
+RANDOM_SEVERITY = "random"
+"""What the severity chooser stores for "a mixture".
+
+A sentinel rather than a fifth :class:`FoldSeverity` member, because a fold
+that has been drawn is always one of the four; "random" is a request, not a
+kind of fold, and putting it in the enum would let it reach a manifest."""
+
+DEFAULT_FOLD_PERCENT = 10
+DEFAULT_MAX_FOLDS_PER_SHEET = 1
+"""Defaults for the fold controls. One corner per affected sheet because more
+than one is genuinely uncommon on real paper."""
+
 PROFILE_DESCRIPTIONS: dict[DatasetProfile, str] = {
     DatasetProfile.BASELINE: "Clean, valid sheets only. Anything failing here is a defect.",
     DatasetProfile.RECOGNITION: (
@@ -136,7 +215,18 @@ class GenerationRequest:
         families: Families for a custom profile.
         image_format: PNG or JPEG.
         jpeg_quality: Quality for JPEG output.
-        dpi: Rendering resolution.
+        dpi: Rendering resolution. Not applied when :attr:`render_mode` is
+            :attr:`~omr_scanner.evaluation.synthetic_dataset.RenderMode.REFERENCE_SCAN`,
+            whose pixels come from a real scan at its own resolution.
+        render_mode: Whether each page is drawn from the template or is a real
+            scanned blank form with marks laid on it.
+        reference_scan: The blank scan to lay marks on. Required by
+            ``RenderMode.REFERENCE_SCAN`` and ignored otherwise.
+        color_mode: Channel layout and tonal range of the written images.
+        fold_policy: Physical corner folds. Disabled by default, and a disabled
+            policy leaves every sheet exactly as it would otherwise have been -
+            which is what lets this field exist without changing what any
+            existing caller's request means.
         name: Dataset name, recorded in the manifest.
         write_metadata: Also write the CSV manifest and the dataset summary.
         run_benchmark: Open the benchmark straight after generating.
@@ -162,6 +252,10 @@ class GenerationRequest:
     image_format: ImageFormat = ImageFormat.PNG
     jpeg_quality: int = DEFAULT_JPEG_QUALITY
     dpi: int = DEFAULT_DPI
+    render_mode: RenderMode = RenderMode.TEMPLATE
+    reference_scan: Path | None = None
+    color_mode: ColorMode = ColorMode.GRAYSCALE
+    fold_policy: FoldPolicy = NO_FOLDS
     name: str = "synthetic"
     write_metadata: bool = True
     run_benchmark: bool = False
@@ -215,6 +309,9 @@ class GenerateDatasetDialog(QDialog):
         template_path: Template to start from - the one the Scan page has
             loaded, when it has one.
         output_dir: Folder to start from.
+        project_dir: The open project's folder, which is where the Browse
+            button for a reference scan opens. Not remembered between runs -
+            see the module docstring.
 
     Testability:
         The widgets carry stable object names and
@@ -228,11 +325,13 @@ class GenerateDatasetDialog(QDialog):
         *,
         template_path: Path | None = None,
         output_dir: Path | None = None,
+        project_dir: Path | None = None,
     ) -> None:
         super().__init__(parent)
         self.setObjectName("generateDatasetDialog")
         self.setWindowTitle("Generate Synthetic Test Dataset")
         self.setModal(True)
+        self._project_dir = project_dir
 
         # The form scrolls; the footer does not. Every group below together is
         # well over a thousand logical pixels tall, which is more than the
@@ -246,7 +345,7 @@ class GenerateDatasetDialog(QDialog):
         inner.setSpacing(Spacing.SM)
 
         self.source_section = self._section(
-            "Template and destination",
+            "Source and destination",
             self._build_source_box(template_path, output_dir),
             expanded=True,
         )
@@ -258,10 +357,14 @@ class GenerateDatasetDialog(QDialog):
             self._build_attendance_box(),
             expanded=True,
         )
-        # Folded by default: the format, quality and resolution are the
-        # settings a developer changes least often, and folding the one group
-        # nobody usually touches is most of the difference between a form that
-        # needs scrolling on a laptop and one that does not.
+        # Folded by default, both of them: the format, quality and resolution
+        # are the settings a developer changes least often, and physical
+        # deformation is off unless somebody has come looking for it. Folding
+        # the groups nobody usually touches is most of the difference between
+        # a form that needs scrolling on a laptop and one that does not.
+        self.deformation_section = self._section(
+            "Physical page deformation", self._build_deformation_box(), expanded=False
+        )
         self.output_section = self._section(
             "Images and output", self._build_output_box(), expanded=False
         )
@@ -303,6 +406,8 @@ class GenerateDatasetDialog(QDialog):
         self._connect_summaries()
         self._on_profile_changed()
         self._on_attendance_toggled()
+        self._on_render_mode_changed()
+        self._on_folds_toggled()
         self._apply_initial_size()
 
         # Keyboard navigation has to scroll, and Qt will not do it here.
@@ -327,6 +432,7 @@ class GenerateDatasetDialog(QDialog):
             self.source_section,
             self.content_section,
             self.attendance_section,
+            self.deformation_section,
             self.output_section,
         )
 
@@ -450,11 +556,106 @@ class GenerateDatasetDialog(QDialog):
         form.addRow("", self.attendance_summary)
         return box
 
+    def _build_deformation_box(self) -> QGroupBox:
+        """What happened to the paper on its way to the scanner.
+
+        Kept to five rows and folded away by default. Everything in here is
+        inert until the one check box at the top is ticked, so an operator who
+        never opens the section generates exactly what they always did.
+        """
+        box = QGroupBox("Physical page deformation")
+        form = QFormLayout(box)
+
+        self.fold_checkbox = QCheckBox("Simulate corner folds")
+        self.fold_checkbox.setObjectName("datasetFoldCheckBox")
+        self.fold_checkbox.setToolTip(
+            "Folds a corner of the finished sheet - paper, printing and the "
+            "candidate's marks together - before the scanner sees it. A fold "
+            "deep enough to cover a registration marker is expected to stop "
+            "the sheet registering, and the dataset records exactly which "
+            "marker it covered and by how much."
+        )
+        self.fold_checkbox.toggled.connect(self._on_folds_toggled)
+        form.addRow("", self.fold_checkbox)
+
+        # Two columns, like the case families above and for the same reason:
+        # a four-item list with its own scrollbar costs more height than the
+        # grid and shows fewer of them.
+        self.fold_corners_widget = QWidget()
+        self.fold_corners_widget.setObjectName("datasetFoldCornersGrid")
+        grid = QGridLayout(self.fold_corners_widget)
+        grid.setContentsMargins(0, 0, 0, 0)
+        grid.setHorizontalSpacing(Spacing.LG)
+        grid.setVerticalSpacing(Spacing.XXS)
+        self.fold_corner_boxes: dict[FoldCorner, QCheckBox] = {}
+        for index, corner in enumerate(FoldCorner):
+            corner_box = QCheckBox(CORNER_LABELS[corner])
+            corner_box.setObjectName(f"datasetFoldCorner_{corner.value}")
+            corner_box.setAccessibleName(f"Eligible fold corner: {corner_box.text()}")
+            corner_box.setChecked(True)
+            corner_box.toggled.connect(self._refresh_summaries)
+            self.fold_corner_boxes[corner] = corner_box
+            grid.addWidget(corner_box, index // FAMILY_COLUMNS, index % FAMILY_COLUMNS)
+        form.addRow("Eligible corners:", self.fold_corners_widget)
+
+        self.fold_frequency_spin = QSpinBox()
+        self.fold_frequency_spin.setObjectName("datasetFoldFrequencySpin")
+        self.fold_frequency_spin.setRange(0, 100)
+        self.fold_frequency_spin.setValue(DEFAULT_FOLD_PERCENT)
+        self.fold_frequency_spin.setSuffix(" %")
+        self.fold_frequency_spin.setToolTip(
+            "Roughly what share of sheets are folded. The deliberate coverage "
+            "cases are filled first, so a small dataset may exceed this to "
+            "make sure every kind of fold is present at all."
+        )
+        self.fold_frequency_spin.valueChanged.connect(self._refresh_summaries)
+
+        self.fold_max_spin = QSpinBox()
+        self.fold_max_spin.setObjectName("datasetFoldMaxSpin")
+        self.fold_max_spin.setRange(1, len(FoldCorner))
+        self.fold_max_spin.setValue(DEFAULT_MAX_FOLDS_PER_SHEET)
+        self.fold_max_spin.setToolTip(
+            "Folded corners on one affected sheet. One by default: more than "
+            "one corner folded on the same page is genuinely uncommon, and "
+            "three or more are capped at moderate so they cannot between them "
+            "consume the page."
+        )
+        form.addRow(
+            "Fold frequency:",
+            _paired(self.fold_frequency_spin, "Max per sheet:", self.fold_max_spin),
+        )
+
+        self.fold_severity_combo = QComboBox()
+        self.fold_severity_combo.setObjectName("datasetFoldSeverityCombo")
+        for severity in FoldSeverity:
+            self.fold_severity_combo.addItem(SEVERITY_LABELS[severity], severity)
+        self.fold_severity_combo.addItem("Random", RANDOM_SEVERITY)
+        self.fold_severity_combo.setCurrentIndex(
+            self.fold_severity_combo.findData(RANDOM_SEVERITY)
+        )
+        self.fold_severity_combo.currentIndexChanged.connect(self._refresh_summaries)
+        form.addRow("Severity:", self.fold_severity_combo)
+
+        self.fold_coverage_checkbox = QCheckBox(
+            "Guarantee one of every marker interaction"
+        )
+        self.fold_coverage_checkbox.setObjectName("datasetFoldCoverageCheckBox")
+        self.fold_coverage_checkbox.setChecked(True)
+        self.fold_coverage_checkbox.setToolTip(
+            "Spend part of the quota on folds chosen to reach no marker, to "
+            "clip one, to cover one, and to catch two at once - rather than "
+            "leaving the spread to chance. An interaction this template's "
+            "geometry cannot produce is skipped, never faked."
+        )
+        self.fold_coverage_checkbox.toggled.connect(self._refresh_summaries)
+        form.addRow("", self.fold_coverage_checkbox)
+        return box
+
     def _build_source_box(
         self, template_path: Path | None, output_dir: Path | None
     ) -> QGroupBox:
-        """Template in, dataset out."""
-        box = QGroupBox("Template and destination")
+        """What the sheets are made of, and where the dataset goes."""
+        box = QGroupBox("Source and destination")
         form = QFormLayout(box)
 
         self.template_edit = QLineEdit(str(template_path) if template_path else "")
@@ -464,6 +665,37 @@ class GenerateDatasetDialog(QDialog):
         browse_template.setObjectName("browseTemplateButton")
         browse_template.clicked.connect(self._prompt_template)
         form.addRow("Template:", _with_button(self.template_edit, browse_template))
+
+        self.render_mode_combo = QComboBox()
+        self.render_mode_combo.setObjectName("datasetRenderModeCombo")
+        for mode in RenderMode:
+            self.render_mode_combo.addItem(RENDER_MODE_LABELS[mode], mode)
+        self.render_mode_combo.setCurrentIndex(
+            self.render_mode_combo.findData(RenderMode.TEMPLATE)
+        )
+        self.render_mode_combo.currentIndexChanged.connect(self._on_render_mode_changed)
+        form.addRow("Render mode:", self.render_mode_combo)
+
+        self.render_mode_description = QLabel("")
+        self.render_mode_description.setObjectName("datasetRenderModeDescription")
+        self.render_mode_description.setWordWrap(True)
+        form.addRow("", self.render_mode_description)
+
+        self.reference_edit = QLineEdit("")
+        self.reference_edit.setObjectName("datasetReferenceScanEdit")
+        self.reference_edit.setPlaceholderText(
+            "Scan of a blank, unmarked sheet of this form"
+        )
+        self.reference_edit.setToolTip(
+            "A clean scan of the printed form with nothing filled in. It is "
+            "registered against the template once, and every sheet's marks are "
+            "laid onto it. It is used for this run only and is not remembered."
+        )
+        self.reference_browse = QPushButton("Browse...")
+        self.reference_browse.setObjectName("browseReferenceScanButton")
+        self.reference_browse.clicked.connect(self._prompt_reference_scan)
+        self.reference_row = _with_button(self.reference_edit, self.reference_browse)
+        form.addRow("Reference scan:", self.reference_row)
 
         self.output_edit = QLineEdit(str(output_dir) if output_dir else "")
         self.output_edit.setObjectName("datasetOutputEdit")
@@ -580,13 +812,26 @@ class GenerateDatasetDialog(QDialog):
             "Image format:", _paired(self.format_combo, "Quality:", self.quality_spin)
         )
 
+        self.color_combo = QComboBox()
+        self.color_combo.setObjectName("datasetColorModeCombo")
+        for mode in ColorMode:
+            self.color_combo.addItem(COLOR_MODE_LABELS[mode], mode)
+        self.color_combo.setCurrentIndex(self.color_combo.findData(ColorMode.GRAYSCALE))
+        self.color_combo.setToolTip(
+            "What a scanner would have been set to. Black and white throws away "
+            "the grey levels a faint pencil mark lives in, before recognition "
+            "ever sees the page - which is the point of offering it."
+        )
+        form.addRow("Colour:", self.color_combo)
+
         self.dpi_spin = QSpinBox()
         self.dpi_spin.setObjectName("datasetDpiSpin")
         self.dpi_spin.setRange(72, 600)
         self.dpi_spin.setValue(DEFAULT_DPI)
         self.dpi_spin.setToolTip(
             "Pages are rendered from the template's physical size, so 150 dpi on A4 "
-            "is 1240 x 1754 pixels."
+            "is 1240 x 1754 pixels. Not used when rendering onto a real scanned "
+            "sheet, whose resolution is already fixed."
         )
         form.addRow("Resolution (dpi):", self.dpi_spin)
 
@@ -616,6 +861,85 @@ class GenerateDatasetDialog(QDialog):
     def selected_format(self) -> ImageFormat:
         """The chosen image format. See :meth:`selected_profile`."""
         return ImageFormat(self.format_combo.currentData())
+
+    def selected_render_mode(self) -> RenderMode:
+        """The chosen rendering mode. See :meth:`selected_profile`."""
+        return RenderMode(self.render_mode_combo.currentData())
+
+    def selected_color_mode(self) -> ColorMode:
+        """The chosen colour mode. See :meth:`selected_profile`."""
+        return ColorMode(self.color_combo.currentData())
+
+    def selected_fold_corners(self) -> tuple[FoldCorner, ...]:
+        """The corners ticked as eligible, in declared order."""
+        return tuple(
+            corner for corner, box in self.fold_corner_boxes.items() if box.isChecked()
+        )
+
+    def selected_fold_severity(self) -> FoldSeverity | None:
+        """The chosen severity, or ``None`` for a mixture.
+
+        ``None`` rather than a fifth enum member: see :data:`RANDOM_SEVERITY`.
+        """
+        chosen = self.fold_severity_combo.currentData()
+        if chosen == RANDOM_SEVERITY:
+            return None
+        return FoldSeverity(chosen)
+
+    def fold_policy(self) -> FoldPolicy:
+        """The fold settings as the core generator's own type.
+
+        Built here rather than in the worker so that a test - and
+        :meth:`request` - can read exactly what will be generated without a
+        dialog on screen, the same way :meth:`GenerationRequest.population`
+        already works for the roster.
+
+        Falls back to every corner when the operator has unticked all four:
+        with folding on and nothing eligible there is nothing to generate, and
+        :class:`FoldPolicy` refuses that outright. :meth:`_on_accept` asks them
+        to fix it rather than silently choosing for them, so this fallback is
+        only ever reached by a caller reading the form mid-edit.
+        """
+        corners = self.selected_fold_corners()
+        enabled = self.fold_checkbox.isChecked()
+        return FoldPolicy(
+            enabled=enabled and bool(corners),
+            corners=corners or tuple(FoldCorner),
+            frequency=self.fold_frequency_spin.value() / 100.0,
+            severity=self.selected_fold_severity(),
+            max_per_sheet=self.fold_max_spin.value(),
+            ensure_coverage=self.fold_coverage_checkbox.isChecked(),
+        )
+
+    def _on_folds_toggled(self) -> None:
+        """Enable the fold controls only while folding is on."""
+        enabled = self.fold_checkbox.isChecked()
+        for widget in (
+            self.fold_corners_widget,
+            self.fold_frequency_spin,
+            self.fold_max_spin,
+            self.fold_severity_combo,
+            self.fold_coverage_checkbox,
+        ):
+            widget.setEnabled(enabled)
+        self._refresh_summaries()
+
+    def _on_render_mode_changed(self) -> None:
+        """Offer the reference scan only when it is used, and say what changes.
+
+        The resolution spin box is disabled rather than hidden in the reference
+        mode: it still has a value, and hiding it would leave an operator
+        wondering where it went. Disabled says "this no longer applies", which
+        is exactly the truth - the pixels come from the scan.
+        """
+        reference = self.selected_render_mode() is RenderMode.REFERENCE_SCAN
+        self.render_mode_description.setText(
+            RENDER_MODE_DESCRIPTIONS.get(self.selected_render_mode(), "")
+        )
+        for widget in (self.reference_edit, self.reference_browse):
+            widget.setEnabled(reference)
+        self.dpi_spin.setEnabled(not reference)
+        self._refresh_summaries()
 
     def _on_profile_changed(self) -> None:
         """Describe the chosen profile, and offer the families only for Custom."""
@@ -667,9 +991,15 @@ class GenerateDatasetDialog(QDialog):
         """
         if not hasattr(self, "output_section"):
             return
-        self.source_section.set_summary(
+        template_name = (
             Path(self.template_edit.text().strip()).name or "no template chosen"
         )
+        if self.selected_render_mode() is RenderMode.REFERENCE_SCAN:
+            reference = self.reference_edit.text().strip()
+            template_name += (
+                f" on {Path(reference).name}" if reference else " - no reference scan"
+            )
+        self.source_section.set_summary(template_name)
         self.content_section.set_summary(
             f"{self.count_spin.value()} sheet(s) - "
             f"{self.selected_profile().value} - seed {self.seed_spin.value()}"
@@ -688,8 +1018,23 @@ class GenerateDatasetDialog(QDialog):
             if self.selected_format() is ImageFormat.JPEG
             else ""
         )
+        if not self.fold_checkbox.isChecked():
+            self.deformation_section.set_summary("no corner folds")
+        else:
+            severity = self.selected_fold_severity()
+            self.deformation_section.set_summary(
+                f"{self.fold_frequency_spin.value()}% folded - "
+                f"{len(self.selected_fold_corners())} corner(s) - "
+                f"{severity.value if severity is not None else 'random'} - "
+                f"up to {self.fold_max_spin.value()} per sheet"
+            )
+        resolution = (
+            "native resolution"
+            if self.selected_render_mode() is RenderMode.REFERENCE_SCAN
+            else f"{self.dpi_spin.value()} dpi"
+        )
         self.output_section.set_summary(
-            f"{self.dpi_spin.value()} dpi - "
+            f"{resolution} - {COLOR_MODE_LABELS[self.selected_color_mode()]} - "
             f"{self.selected_format().value.upper()}{quality}"
         )
 
@@ -701,11 +1046,13 @@ class GenerateDatasetDialog(QDialog):
         summary, and scattering these connections is how one gets missed.
         """
         self.template_edit.textChanged.connect(self._refresh_summaries)
+        self.reference_edit.textChanged.connect(self._refresh_summaries)
         self.name_edit.textChanged.connect(self._refresh_summaries)
         self.sets_edit.textChanged.connect(self._refresh_summaries)
         self.dpi_spin.valueChanged.connect(self._refresh_summaries)
         self.quality_spin.valueChanged.connect(self._refresh_summaries)
         self.format_combo.currentIndexChanged.connect(self._refresh_summaries)
+        self.color_combo.currentIndexChanged.connect(self._refresh_summaries)
         self.absentee_spin.valueChanged.connect(self._refresh_summaries)
         self.attendance_checkbox.toggled.connect(self._refresh_summaries)
 
@@ -808,6 +1155,30 @@ class GenerateDatasetDialog(QDialog):
         if path:
             self.template_edit.setText(path)
 
+    def _prompt_reference_scan(self) -> None:
+        """Ask for the blank scan to lay marks on.
+
+        Opens on the current project's folder when there is one, because that
+        is where a scanned blank form lives; on whatever was already typed if
+        the operator has been here before in this session; and on the home
+        directory only as a last resort.
+        """
+        typed = self.reference_edit.text().strip()
+        if typed:
+            start = typed
+        elif self._project_dir is not None:
+            start = str(self._project_dir)
+        else:
+            start = str(Path.home())
+        path, _filter = QFileDialog.getOpenFileName(
+            self,
+            "Select a scan of a blank sheet",
+            start,
+            "Images (*.png *.jpg *.jpeg *.tif *.tiff *.bmp);;All files (*)",
+        )
+        if path:
+            self.reference_edit.setText(path)
+
     def _prompt_output(self) -> None:
         """Ask for the destination folder."""
         start = self.output_edit.text() or str(Path.home())
@@ -839,9 +1210,22 @@ class GenerateDatasetDialog(QDialog):
         if profile is DatasetProfile.CUSTOM and not families:
             return None
 
+        render_mode = self.selected_render_mode()
+        reference_text = self.reference_edit.text().strip()
+        if render_mode is RenderMode.REFERENCE_SCAN and not reference_text:
+            return None
+        reference_scan = (
+            Path(reference_text)
+            if render_mode is RenderMode.REFERENCE_SCAN and reference_text
+            else None
+        )
+
         with_attendance = self.attendance_checkbox.isChecked()
         set_codes = self.selected_set_codes()
         if with_attendance and not set_codes:
+            return None
+
+        if self.fold_checkbox.isChecked() and not self.selected_fold_corners():
             return None
 
         conflict_profile = self.selected_conflict_profile()
@@ -862,6 +1246,10 @@ class GenerateDatasetDialog(QDialog):
             image_format=self.selected_format(),
             jpeg_quality=self.quality_spin.value(),
             dpi=self.dpi_spin.value(),
+            render_mode=render_mode,
+            reference_scan=reference_scan,
+            color_mode=self.selected_color_mode(),
+            fold_policy=self.fold_policy(),
             name=self.name_edit.text().strip() or "synthetic",
             write_metadata=self.metadata_checkbox.isChecked(),
             run_benchmark=self.benchmark_checkbox.isChecked(),
@@ -889,6 +1277,28 @@ class GenerateDatasetDialog(QDialog):
             return
         if not Path(self.template_edit.text().strip()).is_file():
             self._complain("That template file does not exist.", self.template_edit)
+            return
+        if self.selected_render_mode() is RenderMode.REFERENCE_SCAN:
+            reference = self.reference_edit.text().strip()
+            if not reference:
+                self._complain(
+                    "Rendering onto a real scanned sheet needs a scan of a blank, "
+                    "unmarked form. Select one, or switch the render mode back to "
+                    "template-rendered.",
+                    self.reference_edit,
+                )
+                return
+            if not Path(reference).is_file():
+                self._complain(
+                    "That reference scan does not exist.", self.reference_edit
+                )
+                return
+        if self.fold_checkbox.isChecked() and not self.selected_fold_corners():
+            self._complain(
+                "Corner folds are switched on but no corner is eligible. Tick "
+                "at least one corner, or switch folding off.",
+                self.fold_corners_widget,
+            )
             return
         if not self.output_edit.text().strip():
             self._complain("Choose a folder for the dataset.", self.output_edit)
@@ -967,7 +1377,17 @@ def _paired(first: QWidget, label: str, second: QWidget) -> QWidget:
     return container
 
 
-__all__ = ["PROFILE_DESCRIPTIONS", "GenerateDatasetDialog", "GenerationRequest"]
+__all__ = [
+    "COLOR_MODE_LABELS",
+    "CORNER_LABELS",
+    "PROFILE_DESCRIPTIONS",
+    "RANDOM_SEVERITY",
+    "RENDER_MODE_DESCRIPTIONS",
+    "RENDER_MODE_LABELS",
+    "SEVERITY_LABELS",
+    "GenerateDatasetDialog",
+    "GenerationRequest",
+]
 
 
 

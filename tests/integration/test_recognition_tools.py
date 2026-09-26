@@ -19,6 +19,7 @@ import pytest
 from tests.conftest import build_answer_sheet_template, render_marked_sheet
 
 from omr_scanner.evaluation.benchmark import ERRORS_FILENAME, SUMMARY_FILENAME
+from omr_scanner.evaluation.ground_truth import load_manifest
 from omr_scanner.evaluation.synthetic_dataset import GROUND_TRUTH_DIRNAME, IMAGES_DIRNAME
 from omr_scanner.services.template_service import save_template
 from omr_scanner.tools import benchmark_recognition, make_dataset, recognise
@@ -187,8 +188,14 @@ class TestMakeDatasetTool:
 
         printed = capsys.readouterr().out
         assert "3 sheet(s)" in printed
-        # The caveat travels with the tool, not only with the documentation.
-        assert "not real-world accuracy" in printed
+        # The caveat travels with the tool, not only with the documentation -
+        # and it is now the *dataset's own* caveat rather than a second copy of
+        # one. Asserted against the manifest so the two cannot drift apart, and
+        # because the two rendering modes are honest about different things: a
+        # fixed sentence here would be wrong for one of them.
+        manifest = load_manifest(out / "manifest.json")
+        assert manifest.notes in printed
+        assert "not evidence of real-world recognition accuracy" in manifest.notes
 
     def test_a_missing_template_is_refused(self, tmp_path: Path, capsys):
         code = make_dataset.main([str(tmp_path / "out"), "--template", str(tmp_path / "no.omrt")])
@@ -201,6 +208,218 @@ class TestMakeDatasetTool:
         )
         assert code == 1
         assert "at least one sheet" in capsys.readouterr().err
+
+    def test_a_colour_mode_reaches_the_dataset(
+        self, tmp_path: Path, template_path: Path
+    ):
+        out = tmp_path / "dataset"
+        code = make_dataset.main(
+            [
+                str(out), "--template", str(template_path), "--count", "1",
+                "--color-mode", "color", "--quiet",
+            ]
+        )
+        assert code == 0
+        assert load_manifest(out / "manifest.json").generator["color_mode"] == "color"
+
+
+class TestMakeDatasetOntoARealScan:
+    """The reference-scan mode, driven the way a CI job would drive it.
+
+    The GUI is not the only way to reach this feature, and a mode that only
+    works from a dialog cannot be used in an automated qualification run. These
+    check the three outcomes that matter to a script: it refuses a request it
+    cannot satisfy, it refuses a file it cannot use, and it produces a dataset
+    that says what it is.
+    """
+
+    @pytest.fixture
+    def blank_scan(self, tmp_path: Path, template) -> Path:
+        """A stand-in scan of the printed blank form.
+
+        Rendered rather than photographed: a committed test cannot depend on a
+        file nobody has. What it exercises here is the tool's plumbing - the
+        registration itself is measured in ``tests/unit/test_reference_scan.py``
+        against known homographies.
+        """
+        import cv2
+
+        from omr_scanner.evaluation.synthetic_dataset import (
+            page_render_size,
+            sheet_spec_from_template,
+        )
+        from omr_scanner.imaging.synthetic import render_sheet
+
+        size = page_render_size(template, 200)
+        path = tmp_path / "blank_form.png"
+        cv2.imwrite(
+            str(path), render_sheet(sheet_spec_from_template(template, {}, render=size)).image
+        )
+        return path
+
+    def test_the_mode_without_a_scan_is_refused(
+        self, tmp_path: Path, template_path: Path, capsys
+    ):
+        code = make_dataset.main(
+            [
+                str(tmp_path / "out"), "--template", str(template_path),
+                "--render-mode", "reference_scan", "--count", "1",
+            ]
+        )
+        assert code == 1
+        assert "--reference-scan" in capsys.readouterr().err
+
+    def test_an_unusable_scan_is_refused_by_name(
+        self, tmp_path: Path, template_path: Path, capsys
+    ):
+        bad = tmp_path / "notes.png"
+        bad.write_bytes(b"this is not an image")
+        code = make_dataset.main(
+            [
+                str(tmp_path / "out"), "--template", str(template_path),
+                "--render-mode", "reference_scan", "--reference-scan", str(bad),
+                "--count", "1", "--quiet",
+            ]
+        )
+        assert code == 1
+        error = capsys.readouterr().err
+        assert "notes.png" in error
+        assert "reference scan" in error.lower()
+
+    def test_nothing_is_written_when_the_scan_is_refused(
+        self, tmp_path: Path, template_path: Path
+    ):
+        # The scan is registered before the first sheet is rendered, so a bad
+        # choice costs nothing and leaves no half-written dataset behind.
+        out = tmp_path / "out"
+        bad = tmp_path / "notes.png"
+        bad.write_bytes(b"this is not an image")
+        make_dataset.main(
+            [
+                str(out), "--template", str(template_path),
+                "--render-mode", "reference_scan", "--reference-scan", str(bad),
+                "--count", "50", "--quiet",
+            ]
+        )
+        assert not (out / IMAGES_DIRNAME).exists()
+
+    def test_it_writes_a_dataset_that_says_what_it_is(
+        self, tmp_path: Path, template_path: Path, blank_scan: Path, capsys
+    ):
+        out = tmp_path / "dataset"
+        code = make_dataset.main(
+            [
+                str(out), "--template", str(template_path),
+                "--render-mode", "reference_scan", "--reference-scan", str(blank_scan),
+                "--count", "2", "--seed", "5", "--profile", "baseline",
+            ]
+        )
+        assert code == 0
+        assert len(list((out / IMAGES_DIRNAME).glob("*.png"))) == 2
+
+        generator = load_manifest(out / "manifest.json").generator
+        assert generator["render_mode"] == "reference_scan"
+        assert generator["reference_scan"]["name"] == "blank_form.png"
+        # Null, not the requested DPI: the pixels came from a real scan, and
+        # echoing back a setting that was never applied would describe a
+        # dataset nobody generated.
+        assert generator["dpi"] is None
+
+        printed = capsys.readouterr().out
+        assert "blank_form.png" in printed
+        assert "--dpi is not applied" in printed
+        assert "real scanned blank sheet" in printed
+
+
+class TestMakeDatasetWithFolds:
+    """Corner folds from the command line.
+
+    The same reasoning as the reference-scan mode above: a feature that only
+    works from a dialog cannot be used in an automated qualification run, so
+    the headless path is checked rather than assumed.
+    """
+
+    def test_folding_is_off_unless_asked_for(self, tmp_path: Path, template_path: Path):
+        out = tmp_path / "dataset"
+        code = make_dataset.main(
+            [str(out), "--template", str(template_path), "--count", "4", "--quiet"]
+        )
+        assert code == 0
+        assert load_manifest(out / "manifest.json").generator["folds"] is None
+
+    def test_it_folds_when_asked(self, tmp_path: Path, template_path: Path):
+        out = tmp_path / "dataset"
+        code = make_dataset.main(
+            [
+                str(out), "--template", str(template_path), "--count", "20",
+                "--profile", "baseline", "--folds", "--fold-frequency", "0.5",
+                "--quiet",
+            ]
+        )
+        assert code == 0
+
+        policy = load_manifest(out / "manifest.json").generator["folds"]
+        assert policy["enabled"] is True
+        assert policy["frequency"] == pytest.approx(0.5)
+
+        folded = [
+            path
+            for path in (out / GROUND_TRUTH_DIRNAME).glob("*.json")
+            if "physical_augmentation" in json.loads(path.read_text(encoding="utf-8"))["metadata"]
+        ]
+        assert folded
+
+    def test_the_corners_and_severity_reach_the_manifest(
+        self, tmp_path: Path, template_path: Path
+    ):
+        out = tmp_path / "dataset"
+        code = make_dataset.main(
+            [
+                str(out), "--template", str(template_path), "--count", "8",
+                "--folds", "--fold-corners", "top_left", "bottom_right",
+                "--fold-severity", "moderate", "--fold-max-per-sheet", "2",
+                "--quiet",
+            ]
+        )
+        assert code == 0
+        policy = load_manifest(out / "manifest.json").generator["folds"]
+        assert policy["corners"] == ["top_left", "bottom_right"]
+        assert policy["severity"] == "moderate"
+        assert policy["max_per_sheet"] == 2
+
+    def test_random_severity_is_the_default(self, tmp_path: Path, template_path: Path):
+        out = tmp_path / "dataset"
+        make_dataset.main(
+            [
+                str(out), "--template", str(template_path), "--count", "4",
+                "--folds", "--quiet",
+            ]
+        )
+        assert load_manifest(out / "manifest.json").generator["folds"]["severity"] == "random"
+
+    def test_impossible_fold_settings_are_refused(
+        self, tmp_path: Path, template_path: Path, capsys
+    ):
+        code = make_dataset.main(
+            [
+                str(tmp_path / "out"), "--template", str(template_path),
+                "--folds", "--fold-frequency", "1.5", "--quiet",
+            ]
+        )
+        assert code == 1
+        assert "fold settings" in capsys.readouterr().err
+
+    def test_an_impossible_maximum_is_refused(
+        self, tmp_path: Path, template_path: Path, capsys
+    ):
+        code = make_dataset.main(
+            [
+                str(tmp_path / "out"), "--template", str(template_path),
+                "--folds", "--fold-max-per-sheet", "9", "--quiet",
+            ]
+        )
+        assert code == 1
+        assert "max_per_sheet" in capsys.readouterr().err
 
 
 class TestBenchmarkTool:

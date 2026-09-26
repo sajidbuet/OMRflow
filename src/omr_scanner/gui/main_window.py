@@ -1206,6 +1206,9 @@ class MainWindow(QMainWindow):
             self,
             template_path=template_path,
             output_dir=self._config.default_projects_root,
+            # Where a scanned blank form is kept, when a project is open. Not
+            # remembered afterwards - see the dialog's module docstring.
+            project_dir=self._session.root if self._session is not None else None,
         )
         if dialog.exec() != GenerateDatasetDialog.DialogCode.Accepted:
             return

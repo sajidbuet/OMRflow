@@ -10,6 +10,8 @@ Scope:
     ===== ==========================================================
     A     The menu exists and reaches both commands.
     B     The generation dialog collects a complete, valid request.
+    B2    The render mode and colour controls, and what they gate.
+    B3    The corner-fold controls: off by default, compact, and gated.
     C     Generating really writes a dataset, with progress and a summary.
     D     Cancelling generation stops early and keeps what was written.
     E     Benchmark mode loads a dataset, banners it, and scores a run.
@@ -54,9 +56,15 @@ from omr_scanner.evaluation.synthetic_dataset import (
     IMAGES_DIRNAME,
     MANIFEST_FILENAME,
     CaseFamily,
+    ColorMode,
     DatasetProfile,
+    FoldCorner,
+    FoldSeverity,
     ImageFormat,
+    RenderMode,
     generate_dataset,
+    page_render_size,
+    sheet_spec_from_template,
 )
 from omr_scanner.gui.devtools import (
     BenchmarkResultsDialog,
@@ -64,9 +72,11 @@ from omr_scanner.gui.devtools import (
     GenerateDatasetDialog,
     GenerationRequest,
 )
+from omr_scanner.gui.devtools.generate_dialog import RANDOM_SEVERITY
 from omr_scanner.gui.main_window import MainWindow
 from omr_scanner.gui.pages import WORKFLOW_PAGES
 from omr_scanner.gui.scan.page import ScanPage
+from omr_scanner.imaging.synthetic import render_sheet
 from omr_scanner.services import save_template
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
@@ -114,6 +124,24 @@ def silent_message_boxes(monkeypatch: pytest.MonkeyPatch) -> list[tuple[str, str
         "omr_scanner.gui.error_reporting.QMessageBox.warning", staticmethod(capture)
     )
     return shown
+
+
+@pytest.fixture
+def blank_scan(tmp_path: Path, template: OmrTemplate) -> Path:
+    """A scan of the blank printed form, for the reference-scan mode.
+
+    Rendered rather than photographed, for the same reason as in
+    ``tests/integration/test_real_scan_dataset.py``: a committed test cannot
+    depend on a file nobody has. These dialog tests only need a real file at a
+    real path - none of them registers it.
+    """
+    import cv2
+
+    size = page_render_size(template, 150)
+    sheet = render_sheet(sheet_spec_from_template(template, {}, render=size))
+    path = tmp_path / "blank_form.png"
+    cv2.imwrite(str(path), sheet.image)
+    return path
 
 
 @pytest.fixture
@@ -333,6 +361,438 @@ class TestTheGenerationDialog:
         dialog.format_combo.setCurrentIndex(dialog.format_combo.findData(ImageFormat.JPEG))
         assert dialog.quality_spin.isEnabled() is True
         assert dialog.request().image_format is ImageFormat.JPEG
+
+
+# ----------------------------------------------------------------------
+# B2. Rendering mode and colour
+# ----------------------------------------------------------------------
+class TestTheRenderModeControls:
+    """Choosing between a drawn page and a real scanned one.
+
+    The Generate button is gated on the reference scan, because the mode
+    cannot do anything without it. The *registration* of that scan is not
+    checked here and cannot be: this layer must not import the imaging code
+    (``tests/unit/test_architecture.py``), so the worker reports that failure
+    instead - which it does before writing any sheet.
+    """
+
+    def test_the_template_mode_is_the_default(
+        self, qtbot, tmp_path: Path, template_path: Path
+    ):
+        dialog = GenerateDatasetDialog(template_path=template_path, output_dir=tmp_path)
+        qtbot.addWidget(dialog)
+        assert dialog.selected_render_mode() is RenderMode.TEMPLATE
+        assert dialog.request().render_mode is RenderMode.TEMPLATE
+        assert dialog.request().reference_scan is None
+
+    def test_the_reference_field_is_offered_only_when_it_is_used(
+        self, qtbot, tmp_path: Path, template_path: Path
+    ):
+        dialog = GenerateDatasetDialog(template_path=template_path, output_dir=tmp_path)
+        qtbot.addWidget(dialog)
+        assert dialog.reference_edit.isEnabled() is False
+        _choose_reference_mode(dialog)
+        assert dialog.reference_edit.isEnabled() is True
+        assert dialog.reference_browse.isEnabled() is True
+
+    def test_the_resolution_is_disabled_when_it_no_longer_applies(
+        self, qtbot, tmp_path: Path, template_path: Path
+    ):
+        # The pixels come from the scan, so a DPI setting has nothing to act
+        # on. Disabled rather than hidden: it still has a value, and a control
+        # that vanishes leaves an operator hunting for it.
+        dialog = GenerateDatasetDialog(template_path=template_path, output_dir=tmp_path)
+        qtbot.addWidget(dialog)
+        assert dialog.dpi_spin.isEnabled() is True
+        _choose_reference_mode(dialog)
+        assert dialog.dpi_spin.isEnabled() is False
+
+    def test_the_mode_is_described_to_the_operator(
+        self, qtbot, tmp_path: Path, template_path: Path
+    ):
+        dialog = GenerateDatasetDialog(template_path=template_path, output_dir=tmp_path)
+        qtbot.addWidget(dialog)
+        _choose_reference_mode(dialog)
+        description = dialog.render_mode_description.text()
+        assert "real blank form" in description
+        assert "Resolution (dpi) is not used" in description
+        assert "Marker-damage cases are skipped" in description
+
+    def test_no_request_without_a_reference_scan(
+        self, qtbot, tmp_path: Path, template_path: Path
+    ):
+        dialog = GenerateDatasetDialog(template_path=template_path, output_dir=tmp_path)
+        qtbot.addWidget(dialog)
+        _choose_reference_mode(dialog)
+        assert dialog.request() is None
+
+    def test_the_reference_reaches_the_request(
+        self, qtbot, tmp_path: Path, template_path: Path, blank_scan: Path
+    ):
+        dialog = GenerateDatasetDialog(template_path=template_path, output_dir=tmp_path)
+        qtbot.addWidget(dialog)
+        _choose_reference_mode(dialog)
+        dialog.reference_edit.setText(str(blank_scan))
+        request = dialog.request()
+        assert request is not None
+        assert request.render_mode is RenderMode.REFERENCE_SCAN
+        assert request.reference_scan == blank_scan
+
+    def test_switching_back_drops_the_reference(
+        self, qtbot, tmp_path: Path, template_path: Path, blank_scan: Path
+    ):
+        # A path left in a disabled field must not silently reach a run that
+        # is not going to use it.
+        dialog = GenerateDatasetDialog(template_path=template_path, output_dir=tmp_path)
+        qtbot.addWidget(dialog)
+        _choose_reference_mode(dialog)
+        dialog.reference_edit.setText(str(blank_scan))
+        dialog.render_mode_combo.setCurrentIndex(
+            dialog.render_mode_combo.findData(RenderMode.TEMPLATE)
+        )
+        assert dialog.request().reference_scan is None
+
+    def test_accepting_without_a_reference_complains_and_stays_open(
+        self, qtbot, tmp_path: Path, template_path: Path, silent_message_boxes
+    ):
+        dialog = GenerateDatasetDialog(template_path=template_path, output_dir=tmp_path)
+        qtbot.addWidget(dialog)
+        _choose_reference_mode(dialog)
+        dialog._on_accept()
+        assert dialog.result() != GenerateDatasetDialog.DialogCode.Accepted
+        assert any("blank, unmarked form" in text for _title, text in silent_message_boxes)
+
+    def test_accepting_with_a_missing_file_complains(
+        self, qtbot, tmp_path: Path, template_path: Path, silent_message_boxes
+    ):
+        dialog = GenerateDatasetDialog(template_path=template_path, output_dir=tmp_path)
+        qtbot.addWidget(dialog)
+        _choose_reference_mode(dialog)
+        dialog.reference_edit.setText(str(tmp_path / "nowhere.png"))
+        dialog._on_accept()
+        assert any(
+            "does not exist" in text for _title, text in silent_message_boxes
+        )
+
+    def test_a_complete_reference_form_is_accepted(
+        self, qtbot, tmp_path: Path, template_path: Path, blank_scan: Path
+    ):
+        dialog = GenerateDatasetDialog(template_path=template_path, output_dir=tmp_path)
+        qtbot.addWidget(dialog)
+        _choose_reference_mode(dialog)
+        dialog.reference_edit.setText(str(blank_scan))
+        dialog._on_accept()
+        assert dialog.result() == GenerateDatasetDialog.DialogCode.Accepted
+
+    def test_browse_opens_on_the_project_folder(
+        self, qtbot, tmp_path: Path, template_path: Path, monkeypatch
+    ):
+        """Decision: the scan is an input to this job, not a saved preference.
+
+        Nothing persists it, so the one affordance that makes it quick to find
+        is where the file chooser opens - the project folder, which is where a
+        scanned blank form is kept.
+        """
+        project = tmp_path / "project"
+        project.mkdir()
+        opened: list[str] = []
+        monkeypatch.setattr(
+            "omr_scanner.gui.devtools.generate_dialog.QFileDialog.getOpenFileName",
+            staticmethod(
+                lambda *args, **_kwargs: (opened.append(args[2]), ("", ""))[1]
+            ),
+        )
+        dialog = GenerateDatasetDialog(
+            template_path=template_path, output_dir=tmp_path, project_dir=project
+        )
+        qtbot.addWidget(dialog)
+        _choose_reference_mode(dialog)
+        dialog._prompt_reference_scan()
+        assert opened == [str(project)]
+
+    def test_browse_reopens_where_it_was_left(
+        self, qtbot, tmp_path: Path, template_path: Path, blank_scan: Path, monkeypatch
+    ):
+        opened: list[str] = []
+        monkeypatch.setattr(
+            "omr_scanner.gui.devtools.generate_dialog.QFileDialog.getOpenFileName",
+            staticmethod(
+                lambda *args, **_kwargs: (opened.append(args[2]), ("", ""))[1]
+            ),
+        )
+        dialog = GenerateDatasetDialog(template_path=template_path, output_dir=tmp_path)
+        qtbot.addWidget(dialog)
+        _choose_reference_mode(dialog)
+        dialog.reference_edit.setText(str(blank_scan))
+        dialog._prompt_reference_scan()
+        assert opened == [str(blank_scan)]
+
+    def test_the_folded_summary_names_the_reference(
+        self, qtbot, tmp_path: Path, template_path: Path, blank_scan: Path
+    ):
+        dialog = GenerateDatasetDialog(template_path=template_path, output_dir=tmp_path)
+        qtbot.addWidget(dialog)
+        _choose_reference_mode(dialog)
+        dialog.reference_edit.setText(str(blank_scan))
+        assert blank_scan.name in dialog.source_section.summary_label.text()
+
+    def test_the_folded_summary_says_when_no_reference_is_chosen(
+        self, qtbot, tmp_path: Path, template_path: Path
+    ):
+        dialog = GenerateDatasetDialog(template_path=template_path, output_dir=tmp_path)
+        qtbot.addWidget(dialog)
+        _choose_reference_mode(dialog)
+        assert "no reference scan" in dialog.source_section.summary_label.text()
+
+
+class TestTheColourControl:
+    def test_grayscale_is_the_default(self, qtbot, tmp_path: Path, template_path: Path):
+        dialog = GenerateDatasetDialog(template_path=template_path, output_dir=tmp_path)
+        qtbot.addWidget(dialog)
+        assert dialog.selected_color_mode() is ColorMode.GRAYSCALE
+        assert dialog.request().color_mode is ColorMode.GRAYSCALE
+
+    @pytest.mark.parametrize("mode", list(ColorMode))
+    def test_every_mode_reaches_the_request(
+        self, qtbot, tmp_path: Path, template_path: Path, mode
+    ):
+        dialog = GenerateDatasetDialog(template_path=template_path, output_dir=tmp_path)
+        qtbot.addWidget(dialog)
+        dialog.color_combo.setCurrentIndex(dialog.color_combo.findData(mode))
+        assert dialog.request().color_mode is mode
+
+    def test_the_folded_summary_names_the_colour(
+        self, qtbot, tmp_path: Path, template_path: Path
+    ):
+        dialog = GenerateDatasetDialog(template_path=template_path, output_dir=tmp_path)
+        qtbot.addWidget(dialog)
+        dialog.color_combo.setCurrentIndex(
+            dialog.color_combo.findData(ColorMode.BLACK_AND_WHITE)
+        )
+        assert "Black and white" in dialog.output_section.summary_label.text()
+
+    def test_the_summary_says_native_resolution_in_the_reference_mode(
+        self, qtbot, tmp_path: Path, template_path: Path
+    ):
+        dialog = GenerateDatasetDialog(template_path=template_path, output_dir=tmp_path)
+        qtbot.addWidget(dialog)
+        assert "dpi" in dialog.output_section.summary_label.text()
+        _choose_reference_mode(dialog)
+        assert "native resolution" in dialog.output_section.summary_label.text()
+
+
+class TestTheFoldControls:
+    """Physical page deformation: off by default, and compact when it is not.
+
+    The section exists to be found by somebody looking for it, not to be
+    stumbled into: it starts folded away, everything inside is inert until one
+    check box is ticked, and a request built from an untouched form carries a
+    policy that folds nothing.
+    """
+
+    def test_the_section_starts_folded_away(
+        self, qtbot, tmp_path: Path, template_path: Path
+    ):
+        # The dialog already had a height problem once; a fifth expanded
+        # section would bring it back.
+        dialog = GenerateDatasetDialog(template_path=template_path, output_dir=tmp_path)
+        qtbot.addWidget(dialog)
+        assert dialog.deformation_section.is_expanded is False
+
+    def test_folding_is_off_by_default(
+        self, qtbot, tmp_path: Path, template_path: Path
+    ):
+        dialog = GenerateDatasetDialog(template_path=template_path, output_dir=tmp_path)
+        qtbot.addWidget(dialog)
+        assert dialog.fold_checkbox.isChecked() is False
+        policy = dialog.request().fold_policy
+        assert policy.enabled is False
+        assert policy.active is False
+
+    def test_the_controls_wake_up_with_the_check_box(
+        self, qtbot, tmp_path: Path, template_path: Path
+    ):
+        dialog = GenerateDatasetDialog(template_path=template_path, output_dir=tmp_path)
+        qtbot.addWidget(dialog)
+        controls = (
+            dialog.fold_corners_widget,
+            dialog.fold_frequency_spin,
+            dialog.fold_max_spin,
+            dialog.fold_severity_combo,
+            dialog.fold_coverage_checkbox,
+        )
+        assert not any(control.isEnabled() for control in controls)
+        dialog.fold_checkbox.setChecked(True)
+        assert all(control.isEnabled() for control in controls)
+
+    def test_all_four_corners_are_eligible_when_enabled(
+        self, qtbot, tmp_path: Path, template_path: Path
+    ):
+        dialog = GenerateDatasetDialog(template_path=template_path, output_dir=tmp_path)
+        qtbot.addWidget(dialog)
+        dialog.fold_checkbox.setChecked(True)
+        assert set(dialog.selected_fold_corners()) == set(FoldCorner)
+        assert set(dialog.request().fold_policy.corners) == set(FoldCorner)
+
+    def test_the_defaults_match_the_brief(
+        self, qtbot, tmp_path: Path, template_path: Path
+    ):
+        dialog = GenerateDatasetDialog(template_path=template_path, output_dir=tmp_path)
+        qtbot.addWidget(dialog)
+        dialog.fold_checkbox.setChecked(True)
+        policy = dialog.request().fold_policy
+        assert policy.frequency == pytest.approx(0.10)
+        assert policy.max_per_sheet == 1
+        assert policy.severity is None
+
+    def test_a_corner_can_be_excluded(
+        self, qtbot, tmp_path: Path, template_path: Path
+    ):
+        dialog = GenerateDatasetDialog(template_path=template_path, output_dir=tmp_path)
+        qtbot.addWidget(dialog)
+        dialog.fold_checkbox.setChecked(True)
+        dialog.fold_corner_boxes[FoldCorner.BOTTOM_RIGHT].setChecked(False)
+        corners = dialog.request().fold_policy.corners
+        assert FoldCorner.BOTTOM_RIGHT not in corners
+        assert len(corners) == 3
+
+    def test_the_frequency_reaches_the_policy_as_a_fraction(
+        self, qtbot, tmp_path: Path, template_path: Path
+    ):
+        # Per cent on screen because that is how a person says it; a fraction
+        # in the policy because that is how the generator uses it.
+        dialog = GenerateDatasetDialog(template_path=template_path, output_dir=tmp_path)
+        qtbot.addWidget(dialog)
+        dialog.fold_checkbox.setChecked(True)
+        dialog.fold_frequency_spin.setValue(25)
+        assert dialog.request().fold_policy.frequency == pytest.approx(0.25)
+
+    @pytest.mark.parametrize("severity", list(FoldSeverity))
+    def test_every_severity_reaches_the_policy(
+        self, qtbot, tmp_path: Path, template_path: Path, severity
+    ):
+        dialog = GenerateDatasetDialog(template_path=template_path, output_dir=tmp_path)
+        qtbot.addWidget(dialog)
+        dialog.fold_checkbox.setChecked(True)
+        dialog.fold_severity_combo.setCurrentIndex(
+            dialog.fold_severity_combo.findData(severity)
+        )
+        assert dialog.request().fold_policy.severity is severity
+
+    def test_random_severity_is_none_rather_than_a_fifth_kind(
+        self, qtbot, tmp_path: Path, template_path: Path
+    ):
+        """A fold that has been drawn is always one of the four.
+
+        "Random" is a request, and must not reach a manifest as though it were
+        a kind of fold.
+        """
+        dialog = GenerateDatasetDialog(template_path=template_path, output_dir=tmp_path)
+        qtbot.addWidget(dialog)
+        dialog.fold_checkbox.setChecked(True)
+        dialog.fold_severity_combo.setCurrentIndex(
+            dialog.fold_severity_combo.findData(RANDOM_SEVERITY)
+        )
+        assert dialog.selected_fold_severity() is None
+        assert dialog.request().fold_policy.describe()["severity"] == "random"
+
+    def test_the_maximum_per_sheet_reaches_the_policy(
+        self, qtbot, tmp_path: Path, template_path: Path
+    ):
+        dialog = GenerateDatasetDialog(template_path=template_path, output_dir=tmp_path)
+        qtbot.addWidget(dialog)
+        dialog.fold_checkbox.setChecked(True)
+        dialog.fold_max_spin.setValue(3)
+        assert dialog.request().fold_policy.max_per_sheet == 3
+
+    def test_the_maximum_cannot_exceed_the_corners_that_exist(
+        self, qtbot, tmp_path: Path, template_path: Path
+    ):
+        dialog = GenerateDatasetDialog(template_path=template_path, output_dir=tmp_path)
+        qtbot.addWidget(dialog)
+        assert dialog.fold_max_spin.maximum() == len(FoldCorner)
+
+    def test_coverage_can_be_turned_off(
+        self, qtbot, tmp_path: Path, template_path: Path
+    ):
+        dialog = GenerateDatasetDialog(template_path=template_path, output_dir=tmp_path)
+        qtbot.addWidget(dialog)
+        dialog.fold_checkbox.setChecked(True)
+        dialog.fold_coverage_checkbox.setChecked(False)
+        assert dialog.request().fold_policy.ensure_coverage is False
+
+    def test_no_request_with_folding_on_and_no_corner(
+        self, qtbot, tmp_path: Path, template_path: Path
+    ):
+        dialog = GenerateDatasetDialog(template_path=template_path, output_dir=tmp_path)
+        qtbot.addWidget(dialog)
+        dialog.fold_checkbox.setChecked(True)
+        for box in dialog.fold_corner_boxes.values():
+            box.setChecked(False)
+        assert dialog.request() is None
+
+    def test_accepting_with_no_corner_complains(
+        self, qtbot, tmp_path: Path, template_path: Path, silent_message_boxes
+    ):
+        dialog = GenerateDatasetDialog(template_path=template_path, output_dir=tmp_path)
+        qtbot.addWidget(dialog)
+        dialog.fold_checkbox.setChecked(True)
+        for box in dialog.fold_corner_boxes.values():
+            box.setChecked(False)
+        dialog._on_accept()
+        assert dialog.result() != GenerateDatasetDialog.DialogCode.Accepted
+        assert any(
+            "no corner is eligible" in text for _title, text in silent_message_boxes
+        )
+
+    def test_turning_folding_off_again_clears_the_policy(
+        self, qtbot, tmp_path: Path, template_path: Path
+    ):
+        dialog = GenerateDatasetDialog(template_path=template_path, output_dir=tmp_path)
+        qtbot.addWidget(dialog)
+        dialog.fold_checkbox.setChecked(True)
+        dialog.fold_frequency_spin.setValue(80)
+        dialog.fold_checkbox.setChecked(False)
+        assert dialog.request().fold_policy.active is False
+
+    def test_the_folded_summary_says_nothing_is_folded(
+        self, qtbot, tmp_path: Path, template_path: Path
+    ):
+        dialog = GenerateDatasetDialog(template_path=template_path, output_dir=tmp_path)
+        qtbot.addWidget(dialog)
+        assert "no corner folds" in dialog.deformation_section.summary_label.text()
+
+    def test_the_folded_summary_describes_the_settings(
+        self, qtbot, tmp_path: Path, template_path: Path
+    ):
+        dialog = GenerateDatasetDialog(template_path=template_path, output_dir=tmp_path)
+        qtbot.addWidget(dialog)
+        dialog.fold_checkbox.setChecked(True)
+        dialog.fold_frequency_spin.setValue(30)
+        summary = dialog.deformation_section.summary_label.text()
+        assert "30%" in summary
+        assert "4 corner(s)" in summary
+        assert "random" in summary
+
+    def test_folds_work_alongside_the_reference_scan_mode(
+        self, qtbot, tmp_path: Path, template_path: Path, blank_scan: Path
+    ):
+        # The two features are independent; a request may carry both.
+        dialog = GenerateDatasetDialog(template_path=template_path, output_dir=tmp_path)
+        qtbot.addWidget(dialog)
+        _choose_reference_mode(dialog)
+        dialog.reference_edit.setText(str(blank_scan))
+        dialog.fold_checkbox.setChecked(True)
+        request = dialog.request()
+        assert request.render_mode is RenderMode.REFERENCE_SCAN
+        assert request.fold_policy.active is True
+
+
+def _choose_reference_mode(dialog: GenerateDatasetDialog) -> None:
+    """Switch the dialog to rendering onto a real scanned sheet."""
+    dialog.render_mode_combo.setCurrentIndex(
+        dialog.render_mode_combo.findData(RenderMode.REFERENCE_SCAN)
+    )
 
 
 # ----------------------------------------------------------------------

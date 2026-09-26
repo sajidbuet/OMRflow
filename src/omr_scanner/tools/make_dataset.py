@@ -20,7 +20,22 @@ Usage::
         --template sheet.omrt --profile custom
         --families answers mark_styles intensity
 
+    python -m omr_scanner.tools.make_dataset out/real
+        --template sheet.omrt --render-mode reference_scan
+        --reference-scan scans/blank_form.png --color-mode color
+
+    python -m omr_scanner.tools.make_dataset out/folded
+        --template sheet.omrt --folds --fold-frequency 0.2
+        --fold-severity random --fold-corners top_left top_right
+
     (each example is one command; the options are wrapped for legibility)
+
+Rendering modes:
+    ``--render-mode template`` (the default) draws the whole page. ``--render-mode
+    reference_scan`` draws only the candidate's marks and lays them on a scan of
+    a real blank form, which must be given with ``--reference-scan``. In that
+    mode ``--dpi`` has nothing to act on and is not applied: the output is the
+    reference scan at its own resolution.
 
 Output::
 
@@ -55,13 +70,17 @@ from omr_scanner.evaluation.attendance_dataset import (
     ConflictRates,
     plan_population,
 )
+from omr_scanner.evaluation.fold_plans import FoldCorner, FoldPolicy, FoldSeverity
+from omr_scanner.evaluation.reference_scan import ReferenceScanError
 from omr_scanner.evaluation.synthetic_dataset import (
     DEFAULT_DPI,
     DEFAULT_JPEG_QUALITY,
     CaseFamily,
+    ColorMode,
     DatasetProfile,
     GenerationProgress,
     ImageFormat,
+    RenderMode,
     describe_template,
     generate_dataset,
     page_render_size,
@@ -71,6 +90,13 @@ from omr_scanner.services.template_service import load_template
 
 EXIT_OK = 0
 EXIT_FAILED = 1
+
+RANDOM_SEVERITY = "random"
+"""What ``--fold-severity`` accepts for a mixture of all four bands.
+
+The same spelling the dialog uses, and for the same reason: a fold that has
+been drawn is always one of the four severities, so "random" is a request
+rather than a fifth kind of fold and never reaches a manifest."""
 
 DEFAULT_COUNT = 24
 DEFAULT_SEED = 20260918
@@ -129,7 +155,85 @@ def build_parser() -> argparse.ArgumentParser:
         "--dpi",
         type=int,
         default=DEFAULT_DPI,
-        help="Rendering resolution, derived from the template's physical page size.",
+        help=(
+            "Rendering resolution, derived from the template's physical page size. "
+            "Not applied with '--render-mode reference_scan', whose pixels come "
+            "from a real scan."
+        ),
+    )
+    parser.add_argument(
+        "--render-mode",
+        choices=[mode.value for mode in RenderMode],
+        default=RenderMode.TEMPLATE.value,
+        help=(
+            "Where each page comes from: 'template' draws the whole sheet, "
+            "'reference_scan' draws only the marks and lays them on a real "
+            "scanned blank form."
+        ),
+    )
+    parser.add_argument(
+        "--reference-scan",
+        type=Path,
+        help=(
+            "The scanned blank form to lay marks on. Required by "
+            "'--render-mode reference_scan'."
+        ),
+    )
+    parser.add_argument(
+        "--color-mode",
+        choices=[mode.value for mode in ColorMode],
+        default=ColorMode.GRAYSCALE.value,
+        help=(
+            "Channel layout and tonal range of the written images: grayscale "
+            "(the default), color, or bw for a one-bit scan."
+        ),
+    )
+    parser.add_argument(
+        "--folds",
+        action="store_true",
+        help=(
+            "Physically fold a corner of some sheets, after everything has "
+            "been printed and marked on them. Off by default."
+        ),
+    )
+    parser.add_argument(
+        "--fold-frequency",
+        type=float,
+        default=FoldPolicy().frequency,
+        help=(
+            "Fraction of sheets to fold, e.g. 0.1 for one in ten. The "
+            "deliberate coverage cases are filled first, so a small dataset "
+            "may exceed this rather than omit a case."
+        ),
+    )
+    parser.add_argument(
+        "--fold-corners",
+        nargs="+",
+        choices=[corner.value for corner in FoldCorner],
+        help="Which corners may be folded. All four when not given.",
+    )
+    parser.add_argument(
+        "--fold-severity",
+        choices=[*(severity.value for severity in FoldSeverity), RANDOM_SEVERITY],
+        default=RANDOM_SEVERITY,
+        help="How deep the folds are; 'random' mixes all four bands.",
+    )
+    parser.add_argument(
+        "--fold-max-per-sheet",
+        type=int,
+        default=FoldPolicy().max_per_sheet,
+        help=(
+            "Folded corners on one affected sheet, 1 to 4. Three or more are "
+            "capped at moderate so they cannot consume the page."
+        ),
+    )
+    parser.add_argument(
+        "--no-fold-coverage",
+        action="store_true",
+        help=(
+            "Do not spend part of the quota on deliberately chosen marker "
+            "interactions; fold entirely at random instead."
+        ),
     )
     parser.add_argument(
         "--sets",
@@ -191,6 +295,36 @@ def main(argv: list[str] | None = None) -> int:
             print(f"{key:<22} {value}")
         return EXIT_OK
 
+    render_mode = RenderMode(arguments.render_mode)
+    color_mode = ColorMode(arguments.color_mode)
+    if render_mode is RenderMode.REFERENCE_SCAN and arguments.reference_scan is None:
+        print(
+            "'--render-mode reference_scan' needs '--reference-scan <blank scan>'.",
+            file=sys.stderr,
+        )
+        return EXIT_FAILED
+
+    try:
+        fold_policy = FoldPolicy(
+            enabled=arguments.folds,
+            corners=(
+                tuple(FoldCorner(name) for name in arguments.fold_corners)
+                if arguments.fold_corners
+                else tuple(FoldCorner)
+            ),
+            frequency=arguments.fold_frequency,
+            severity=(
+                None
+                if arguments.fold_severity == RANDOM_SEVERITY
+                else FoldSeverity(arguments.fold_severity)
+            ),
+            max_per_sheet=arguments.fold_max_per_sheet,
+            ensure_coverage=not arguments.no_fold_coverage,
+        )
+    except ValueError as exc:
+        print(f"Those fold settings cannot be used: {exc}", file=sys.stderr)
+        return EXIT_FAILED
+
     set_codes = tuple(
         code.strip() for code in arguments.sets.split(",") if code.strip()
     )
@@ -221,16 +355,31 @@ def main(argv: list[str] | None = None) -> int:
             if population is not None
             else arguments.count
         )
-        print(
-            f"Rendering {sheets} sheet(s) at {render.width}x{render.height} px "
-            f"({render.dpi} dpi, from the template's {render.derived_from} page size) "
-            f"as {image_format.value.upper()}"
-        )
+        if render_mode is RenderMode.REFERENCE_SCAN:
+            print(
+                f"Rendering {sheets} sheet(s) as marks laid on "
+                f"'{arguments.reference_scan.name}' at its own resolution "
+                f"(--dpi is not applied in this mode) "
+                f"as {image_format.value.upper()}, {color_mode.value}"
+            )
+        else:
+            print(
+                f"Rendering {sheets} sheet(s) at {render.width}x{render.height} px "
+                f"({render.dpi} dpi, from the template's {render.derived_from} page "
+                f"size) as {image_format.value.upper()}, {color_mode.value}"
+            )
         if population is not None:
             print(
                 f"  {len(population.candidates)} candidate(s) across "
                 f"{len(population.by_set())} set(s); attendance workbooks and "
                 "reconciliation ground truth will be written alongside the images"
+            )
+        if fold_policy.active:
+            print(
+                f"  folding ~{fold_policy.frequency:.0%} of sheets at "
+                f"{len(fold_policy.corners)} corner(s), "
+                f"{arguments.fold_severity} severity, up to "
+                f"{fold_policy.max_per_sheet} per sheet"
             )
 
     def report(progress: GenerationProgress) -> None:
@@ -257,8 +406,18 @@ def main(argv: list[str] | None = None) -> int:
             name=arguments.name,
             version=arguments.version,
             template_path=str(arguments.template),
+            render_mode=render_mode,
+            reference_scan=arguments.reference_scan,
+            color_mode=color_mode,
+            fold_policy=fold_policy,
             on_progress=None if arguments.quiet else report,
         )
+    except ReferenceScanError as exc:
+        # Its own branch because the operator can act on it: the file they
+        # chose is the problem, and the message says which of the two inputs
+        # to change.
+        print(f"Could not use the reference scan: {exc.user_message}", file=sys.stderr)
+        return EXIT_FAILED
     except (ValueError, OSError) as exc:
         print(f"Could not generate the dataset: {exc}", file=sys.stderr)
         return EXIT_FAILED
@@ -267,7 +426,7 @@ def main(argv: list[str] | None = None) -> int:
         f"{len(manifest.entries)} sheet(s) written to {arguments.output} "
         f"(profile '{arguments.profile}', seed {arguments.seed}, template '{template.name}')"
     )
-    print("Synthetic data measures regressions, not real-world accuracy.")
+    print(manifest.notes)
     return EXIT_OK
 
 

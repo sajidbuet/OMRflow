@@ -31,6 +31,7 @@ from typing import TYPE_CHECKING
 
 from PySide6.QtCore import QThread, Signal
 
+from omr_scanner.errors import OMRScannerError
 from omr_scanner.evaluation.synthetic_dataset import generate_dataset
 from omr_scanner.services import BatchProgressTracker, JobStatus, load_template
 
@@ -90,6 +91,13 @@ class DatasetWorker(QThread):
         Every failure is turned into a ``failed`` signal rather than an
         exception: this runs on a Qt thread, and an exception escaping here
         takes the thread down without telling anybody why.
+
+        A reference scan that cannot be registered fails here, and it fails
+        *early*: the generator loads and registers it before rendering a single
+        sheet, so an operator who chose the wrong file learns immediately
+        rather than after a long run. The dialog cannot make this check itself
+        - it would have to import the imaging layer, which the architecture
+        forbids it (see ``generate_dialog``'s module docstring).
         """
         request = self._request
         self._tracker.prepare()
@@ -120,13 +128,23 @@ class DatasetWorker(QThread):
                 template_path=str(request.template_path),
                 write_metadata=request.write_metadata,
                 population=population,
+                render_mode=request.render_mode,
+                reference_scan=request.reference_scan,
+                color_mode=request.color_mode,
+                fold_policy=request.fold_policy,
                 on_progress=self._on_sheet,
                 should_cancel=lambda: self._cancelled,
             )
         except Exception as exc:
             self._tracker.fail()
             _LOGGER.exception("Dataset generation failed")
-            self.failed.emit(str(exc))
+            # An OMRFlow failure already carries wording meant for a person -
+            # "that file is not an image OMRFlow can read" rather than the
+            # technical form that belongs in the log, which the line above has
+            # already written in full.
+            self.failed.emit(
+                exc.user_message if isinstance(exc, OMRScannerError) else str(exc)
+            )
             return
 
         self._tracker.finish(cancelled=self._cancelled)

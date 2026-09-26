@@ -186,7 +186,7 @@ enter an answer key → score → generate reports.
 | **[Documentation home](docs/wiki/Home.md)** | Everything, organised |
 | [Installation](docs/wiki/Installation.md) | Requirements, install, upgrade, uninstall |
 | [Quick Start](docs/wiki/Quick-Start.md) | The whole workflow, with synthetic data |
-| [Synthetic datasets](docs/testing/SYNTHETIC_DATA.md) | Generating test scans **and** attendance workbooks with exact ground truth |
+| [Synthetic datasets](docs/testing/SYNTHETIC_DATA.md) | Generating test scans — fully drawn, or synthetic marks laid on a real blank scan, optionally with folded corners — **and** attendance workbooks with exact ground truth |
 | [User Guide](docs/wiki/User-Guide.md) | The nine stages in detail |
 | [Scan quality](docs/scan_quality.md) | How a folded or curled sheet is detected, and what it deliberately does not flag |
 | [Known Limitations](docs/wiki/Known-Limitations.md) | **What is and is not trustworthy yet** |
@@ -224,6 +224,8 @@ synthetically tested" to a qualified stable release.
 | Cross-platform CI | 🟠 Tests and packaging green on Windows and Ubuntu ([run 36210285696](https://github.com/sajidbuet/OMRFlow/actions/runs/36210285696), 2026-09-26); the lint/type gate was red from 2026-09-25, when SQLAlchemy 2.1 respelled a query annotation — corrected, awaiting a confirming run |
 | Synthetic end-to-end | ✅ Passing, from source |
 | Synthetic qualification data | ✅ Template-driven scans **and** set-specific attendance workbooks with deliberate reconciliation conflicts and exact ground truth — see [Synthetic datasets](docs/testing/SYNTHETIC_DATA.md) |
+| Synthetic marks on real paper | 🟠 **Implemented — automated tests passing, real-paper smoke test pending.** Marks drawn onto a scan of a real blank form, registered through the production alignment pipeline, in colour / grayscale / black-and-white; attendance and reconciliation generation are unaffected by the choice of mode. Automated coverage passes, including registration measured against known homographies (worst case 0.33 px at the bubble centres) and the recognition engine reading generated sheets exactly as labelled. Exercised against *rendered stand-in* blank scans only — **no genuine scanned sheet has been through it yet**; the [procedure](docs/testing/SYNTHETIC_DATA.md) is written and waiting. The marks themselves remain synthetic in both modes |
+| Physical corner folds | 🟠 **Implemented — targeted tests passing, full suite not yet re-run.** Micro / small / moderate / severe folds at any of the four corners, in both rendering modes, applied to the composed sheet so paper, printing and marks fold together. Marker interaction is computed from the template's actual marker polygons — per-marker overlap fractions, including the orientation mark — and an interaction the geometry cannot produce is reported as not applicable rather than faked. Off by default, and a disabled policy is byte-identical to a run from before folds existed. 236 new automated tests pass; see [Synthetic datasets](docs/testing/SYNTHETIC_DATA.md) |
 | Packaged application | ✅ Launches, navigates and closes cleanly under UI Automation |
 | Installer | ✅ Install → launch → uninstall → **user data preserved** → reinstall |
 | Clean machine | ✅ 56/56 automated checks on a pristine Windows image; its manual steps outstanding |

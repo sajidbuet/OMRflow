@@ -220,12 +220,25 @@ class GenerationSummaryDialog(QDialog):
         headline.setObjectName("generationSummaryHeadline")
         layout.addWidget(headline)
 
+        # `dpi` is null when the pages came from a real scan, which has no
+        # declared resolution - printing "None dpi" would read as a defect.
+        dpi = generator.get("dpi")
+        resolution = f"at {dpi} dpi" if dpi else "at its own resolution"
+        reference = generator.get("reference_scan") or {}
+        source = (
+            f"Source: marks on '{reference.get('name', '-')}'<br>"
+            if reference
+            else ""
+        )
+
         details = QLabel(
             f"Folder: {output_dir}<br>"
             f"Template: {generator.get('template_name', '-')}<br>"
+            f"{source}"
             f"Profile: {generator.get('profile', '-')} · Seed: {generator.get('seed', '-')}<br>"
-            f"Images: {pixels[0]} x {pixels[1]} px at {generator.get('dpi', '-')} dpi, "
-            f"{str(generator.get('image_format', '')).upper()}"
+            f"Images: {pixels[0]} x {pixels[1]} px {resolution}, "
+            f"{str(generator.get('image_format', '')).upper()}, "
+            f"{generator.get('color_mode', 'grayscale')!s}"
         )
         details.setObjectName("generationSummaryDetails")
         details.setWordWrap(True)
@@ -239,10 +252,10 @@ class GenerationSummaryDialog(QDialog):
         reproduce.setWordWrap(True)
         layout.addWidget(reproduce)
 
-        caveat = QLabel(
-            "Synthetic data measures regression consistency and controlled edge cases, "
-            "not real-world accuracy."
-        )
+        # The manifest's own note, not a copy of it: the two rendering modes
+        # are honest about different things, and a fixed sentence here would
+        # overstate one of them.
+        caveat = QLabel(manifest.notes)
         caveat.setObjectName("generationSummaryCaveat")
         caveat.setWordWrap(True)
         layout.addWidget(caveat)

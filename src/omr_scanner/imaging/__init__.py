@@ -17,7 +17,10 @@ Modules:
     * ``geometry.py``         - point ordering, quadrilateral checks, homography.
     * ``alignment.py``        - the orchestrator; :func:`align_sheet`.
     * ``diagnostics.py``      - optional overlays and textual reports.
-    * ``synthetic.py``        - synthetic sheets and reproducible distortions.
+    * ``synthetic.py``        - synthetic sheets, mark layers, colour modes and
+      reproducible distortions.
+    * ``folds.py``            - a physically folded page corner: local, not
+      projective, and therefore not something a homography can undo.
     * ``metrics.py``          - per-bubble fill measurements *(Phase 3)*.
 
 The public entry point is :func:`align_sheet`::

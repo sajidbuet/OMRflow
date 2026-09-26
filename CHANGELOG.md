@@ -14,6 +14,54 @@ produced them, because that is how the work was sequenced and how
 
 ### Added
 
+- **Physical corner folds in generated datasets.** Micro / small / moderate /
+  severe folds at any of the four page corners, off by default, in **both**
+  rendering modes. The fold is applied to the *composed* sheet — printed
+  artwork, registration marks and the candidate's own marks fold together —
+  after everything is on the page and before the scanner's blur and noise. It
+  is a local deformation, not a global transform: the corner triangle is
+  vacated, its mirror image is covered by the flap, and the rest of the page is
+  untouched.
+
+  Marker interaction is computed from the template's **actual marker
+  geometry** — every registration marker and the orientation mark as polygons,
+  with each affected marker recorded individually and with its own overlap
+  fraction. There is no "corner marker" or "side marker" concept: a template
+  whose mark sits along an edge is handled by the same arithmetic. An
+  interaction the geometry cannot produce (two markers under one fold at a
+  corner that has only one) is reported as not applicable rather than faked.
+
+  A fold sets `expect_failure` only when a registration marker is ≥ 90 %
+  covered, which is a geometric statement; between "touched" and "substantial"
+  the dataset deliberately asserts no outcome. Available as **Tools →
+  Developer / Testing → Generate Synthetic Test Dataset… → Physical page
+  deformation** and as `--folds` with `--fold-frequency`, `--fold-corners`,
+  `--fold-severity` and `--fold-max-per-sheet`.
+- `omr_scanner.imaging.folds` (`FoldSpec`, `FoldCorner`, `FoldSeverity`,
+  `PagePlacement`, `apply_corner_fold`, `fold_region`, `overlap_fraction`) and
+  `omr_scanner.evaluation.fold_plans` (`FoldPolicy`, `marker_outlines`,
+  `measure_overlaps`, `classify`, `solve_fold`, `plan_folds`,
+  `describe_folds`).
+- **A second synthetic rendering mode: synthetic marks on a real scanned
+  sheet.** `RenderMode.REFERENCE_SCAN` draws only the candidate's ink and lays
+  it on a scan of a real blank form, so the paper, printing, illumination and
+  scanner behaviour in a generated dataset are real rather than modelled. The
+  blank scan is registered once per run through the production
+  `imaging.align_sheet` pipeline, not a second registration built for the
+  generator; a scan that will not register is refused before any sheet is
+  written. Available in **Tools → Developer / Testing → Generate Synthetic Test
+  Dataset…** and as `--render-mode reference_scan --reference-scan <file>`.
+  The logical ground truth is identical to the template-rendered mode for the
+  same seed. See [Synthetic datasets](docs/testing/SYNTHETIC_DATA.md).
+- **Colour, grayscale and black-and-white output** for both rendering modes
+  (`--color-mode`, and a **Colour** control in the dialog). Colour is chosen
+  before degradation so noise and blur act per channel; bilevel quantisation
+  happens last, so a one-bit dataset really has lost the grey levels a faint
+  pencil mark lives in.
+- `imaging.synthetic.render_mark_layer`, `composite_marks`, `distort_image`,
+  `page_distortion_homography`, `capture_channels` and `quantise_to_output`;
+  `evaluation.reference_scan` (`load_reference_scan`, `render_onto_reference`,
+  `ReferenceScanError`); `evaluation.synthetic_dataset.strip_unrenderable_defects`.
 - `ConflictType.requires_resolution` and `FieldKind.is_record_identity`
   (`omr_scanner.domain.review`) — the single definition of what belongs in the
   Conflict Resolution queue, read by detection, the store, the GUI and the
@@ -24,6 +72,18 @@ produced them, because that is how the work was sequenced and how
 
 ### Changed
 
+- Synthetic generator version is now `2.2`; manifests and per-sheet ground
+  truth record `render_mode`, `color_mode`, the reference scan's name and
+  registration quality, and - for a folded sheet -
+  `metadata.physical_augmentation` with each fold's corner, severity, both
+  depths, its crease in normalised page coordinates and every marker it
+  covered. `generator.folds` records the fold policy, and is `null` when
+  nothing was folded. A dataset rendered onto a real scan records its
+  resolution as `null` rather than echoing back a `--dpi` that was not applied.
+  In that mode, marker and orientation defects are removed from the case
+  *and from its tags and `expect_failure`*, because the printed marks belong to
+  the scan — a benchmark therefore never reports a `MARKER_MISSING` category it
+  did not test.
 - **Conflict Resolution now applies only to the student ID / roll number, the
   set code and sheets that could not be read.** An ambiguous or multiply-marked
   *answer* is no longer a conflict: it stays in the recognition result, exports
